@@ -364,12 +364,6 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
 fn validate_graph(checks: &[Check], errors: &mut Vec<String>) {
     for (index, check) in checks.iter().enumerate() {
         for &dependency in &check.depends_on {
-            if check.required && !checks[dependency].required {
-                errors.push(format!(
-                    "required check {} depends on optional check {}",
-                    check.id, checks[dependency].id
-                ));
-            }
             if !check.platforms.is_subset(&checks[dependency].platforms) {
                 errors.push(format!(
                     "check {} is applicable where dependency {} is not",
@@ -381,7 +375,43 @@ fn validate_graph(checks: &[Check], errors: &mut Vec<String>) {
         if reaches(index, index, checks, &mut visiting) {
             errors.push(format!("check {} has a dependency cycle", check.id));
         }
+        if check.required {
+            let mut path = vec![index];
+            if let Some(path) = optional_dependency_path(index, checks, &mut path) {
+                let labels = path
+                    .iter()
+                    .map(|index| checks[*index].id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                let optional = checks[*path.last().expect("path is not empty")].id.as_str();
+                errors.push(format!(
+                    "required check {} depends on optional check {} via {}",
+                    check.id, optional, labels
+                ));
+            }
+        }
     }
+}
+
+fn optional_dependency_path(
+    node: usize,
+    checks: &[Check],
+    path: &mut Vec<usize>,
+) -> Option<Vec<usize>> {
+    for &dependency in &checks[node].depends_on {
+        if path.contains(&dependency) {
+            continue;
+        }
+        path.push(dependency);
+        if !checks[dependency].required {
+            return Some(path.clone());
+        }
+        if let Some(found) = optional_dependency_path(dependency, checks, path) {
+            return Some(found);
+        }
+        path.pop();
+    }
+    None
 }
 
 fn reaches(root: usize, node: usize, checks: &[Check], visiting: &mut BTreeSet<usize>) -> bool {
