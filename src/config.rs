@@ -95,8 +95,7 @@ struct RawCheck {
     required: bool,
     #[serde(default)]
     depends_on: Vec<String>,
-    #[serde(default)]
-    platforms: Vec<Platform>,
+    platforms: Option<Vec<Platform>>,
     group: Option<String>,
     help: Option<String>,
     variable: Option<String>,
@@ -304,8 +303,10 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
         if let Some(help) = &check.help {
             validate_text("checks.help", help, 2048, &mut errors);
         }
-        if check.platforms.len() > 3 || has_duplicates(&check.platforms) {
-            errors.push(format!("check {} has invalid platforms", check.id));
+        if let Some(platforms) = &check.platforms {
+            if platforms.is_empty() || platforms.len() > 3 || has_duplicates(platforms) {
+                errors.push(format!("check {} has invalid platforms", check.id));
+            }
         }
         if check.depends_on.len() > 128
             || has_duplicates(&check.depends_on)
@@ -314,41 +315,54 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
             errors.push(format!("check {} has invalid dependencies", check.id));
         }
     }
-    if !errors.is_empty() {
-        return Err(errors.into_iter().take(50).collect::<Vec<_>>().join("\n"));
-    }
-
     let mut checks = Vec::with_capacity(raw.checks.len());
     for check in &raw.checks {
         match validate_check(check, raw.runner.default_timeout_seconds) {
-            Ok(spec) => checks.push(Check {
+            Ok(spec) => checks.push(Some(Check {
                 id: check.id.clone(),
                 name: check.name.clone(),
                 required: check.required,
                 depends_on: Vec::new(),
-                platforms: normalise_platforms(&check.platforms),
+                platforms: normalise_platforms(check.platforms.as_deref()),
                 group: check.group.clone(),
                 help: check.help.clone(),
                 spec,
-            }),
-            Err(error) => errors.push(format!("check {}: {error}", check.id)),
+            })),
+            Err(error) => {
+                errors.push(format!("check {}: {error}", check.id));
+                checks.push(None);
+            }
         }
     }
     for (index, check) in raw.checks.iter().enumerate() {
+        let mut dependencies = Vec::new();
         for dependency in &check.depends_on {
             match ids.get(dependency.as_str()) {
-                Some(&dependency_index) => checks[index].depends_on.push(dependency_index),
+                Some(&dependency_index) if checks[dependency_index].is_some() => {
+                    dependencies.push(dependency_index)
+                }
+                Some(_) => errors.push(format!(
+                    "check {} depends on invalid check {}",
+                    check.id, dependency
+                )),
                 None => errors.push(format!(
                     "check {} depends on unknown check {}",
                     check.id, dependency
                 )),
             }
         }
+        if let Some(validated_check) = checks[index].as_mut() {
+            validated_check.depends_on = dependencies;
+        }
     }
     validate_graph(&checks, &mut errors);
     if !errors.is_empty() {
         return Err(errors.into_iter().take(50).collect::<Vec<_>>().join("\n"));
     }
+    let checks = checks
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .expect("checks have no validation errors");
     Ok(ValidatedConfig {
         path,
         project_name: raw.project.name,
@@ -361,13 +375,19 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
     })
 }
 
-fn validate_graph(checks: &[Check], errors: &mut Vec<String>) {
+fn validate_graph(checks: &[Option<Check>], errors: &mut Vec<String>) {
     for (index, check) in checks.iter().enumerate() {
+        let Some(check) = check else {
+            continue;
+        };
         for &dependency in &check.depends_on {
-            if !check.platforms.is_subset(&checks[dependency].platforms) {
+            let Some(dependency_check) = checks[dependency].as_ref() else {
+                continue;
+            };
+            if !check.platforms.is_subset(&dependency_check.platforms) {
                 errors.push(format!(
                     "check {} is applicable where dependency {} is not",
-                    check.id, checks[dependency].id
+                    check.id, dependency_check.id
                 ));
             }
         }
@@ -380,10 +400,14 @@ fn validate_graph(checks: &[Check], errors: &mut Vec<String>) {
             if let Some(path) = optional_dependency_path(index, checks, &mut path) {
                 let labels = path
                     .iter()
-                    .map(|index| checks[*index].id.as_str())
+                    .map(|index| checks[*index].as_ref().expect("valid path").id.as_str())
                     .collect::<Vec<_>>()
                     .join(" -> ");
-                let optional = checks[*path.last().expect("path is not empty")].id.as_str();
+                let optional = checks[*path.last().expect("path is not empty")]
+                    .as_ref()
+                    .expect("valid path")
+                    .id
+                    .as_str();
                 errors.push(format!(
                     "required check {} depends on optional check {} via {}",
                     check.id, optional, labels
@@ -395,15 +419,17 @@ fn validate_graph(checks: &[Check], errors: &mut Vec<String>) {
 
 fn optional_dependency_path(
     node: usize,
-    checks: &[Check],
+    checks: &[Option<Check>],
     path: &mut Vec<usize>,
 ) -> Option<Vec<usize>> {
-    for &dependency in &checks[node].depends_on {
+    let check = checks[node].as_ref()?;
+    for &dependency in &check.depends_on {
         if path.contains(&dependency) {
             continue;
         }
         path.push(dependency);
-        if !checks[dependency].required {
+        let dependency_check = checks[dependency].as_ref()?;
+        if !dependency_check.required {
             return Some(path.clone());
         }
         if let Some(found) = optional_dependency_path(dependency, checks, path) {
@@ -414,8 +440,16 @@ fn optional_dependency_path(
     None
 }
 
-fn reaches(root: usize, node: usize, checks: &[Check], visiting: &mut BTreeSet<usize>) -> bool {
-    for &next in &checks[node].depends_on {
+fn reaches(
+    root: usize,
+    node: usize,
+    checks: &[Option<Check>],
+    visiting: &mut BTreeSet<usize>,
+) -> bool {
+    let Some(check) = checks[node].as_ref() else {
+        return false;
+    };
+    for &next in &check.depends_on {
         if next == root || (visiting.insert(next) && reaches(root, next, checks, visiting)) {
             return true;
         }
@@ -473,7 +507,7 @@ fn validate_check(check: &RawCheck, default_timeout_seconds: u64) -> Result<Chec
             validate_path_syntax(
                 path,
                 false,
-                &normalise_platforms(&check.platforms)
+                &normalise_platforms(check.platforms.as_deref())
                     .into_iter()
                     .collect::<Vec<_>>(),
             )?;
@@ -525,7 +559,7 @@ fn validate_check(check: &RawCheck, default_timeout_seconds: u64) -> Result<Chec
                 validate_path_syntax(
                     directory,
                     true,
-                    &normalise_platforms(&check.platforms)
+                    &normalise_platforms(check.platforms.as_deref())
                         .into_iter()
                         .collect::<Vec<_>>(),
                 )?;
@@ -713,7 +747,7 @@ fn is_kebab_case(value: &str) -> bool {
         && !value.ends_with('-')
         && !value.contains("--")
 }
-fn is_env_name(value: &str) -> bool {
+pub(crate) fn is_env_name(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some('A'..='Z' | 'a'..='z' | '_'))
         && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
@@ -722,12 +756,10 @@ fn has_duplicates<T: Ord + Clone>(values: &[T]) -> bool {
     let mut set = BTreeSet::new();
     values.iter().any(|value| !set.insert(value.clone()))
 }
-fn normalise_platforms(platforms: &[Platform]) -> BTreeSet<Platform> {
-    if platforms.is_empty() {
-        ALL_PLATFORMS.iter().copied().collect()
-    } else {
-        platforms.iter().copied().collect()
-    }
+fn normalise_platforms(platforms: Option<&[Platform]>) -> BTreeSet<Platform> {
+    platforms
+        .map(|platforms| platforms.iter().copied().collect())
+        .unwrap_or_else(|| ALL_PLATFORMS.iter().copied().collect())
 }
 
 fn validate_path_syntax(
@@ -805,9 +837,10 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), String> {
         let lower = name.to_ascii_lowercase();
         if name.is_empty()
             || name.len() > 8192
-            || has_unsafe_text(name)
+            || !is_http_header_name(name)
             || value.len() > 8192
             || has_unsafe_text(value)
+            || !has_valid_header_interpolation(value)
             || forbidden.contains(&lower.as_str())
             || !names.insert(lower)
         {
@@ -815,4 +848,42 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn is_http_header_name(value: &str) -> bool {
+    value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    })
+}
+
+fn has_valid_header_interpolation(value: &str) -> bool {
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return false;
+        };
+        if !is_env_name(&after[..end]) {
+            return false;
+        }
+        rest = &after[end + 1..];
+    }
+    true
 }

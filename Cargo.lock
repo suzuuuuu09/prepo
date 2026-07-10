@@ -796,6 +796,7 @@ dependencies = [
  "nix",
  "regex",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sysinfo",

@@ -142,6 +142,35 @@ timeout_seconds = 1
     assert_eq!(value["results"][0]["reason"], "timed_out");
 }
 
+#[cfg(windows)]
+#[test]
+fn command_timeout_returns_a_check_failure_without_hanging() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "slow-command"
+type = "command"
+name = "Slow command"
+command = ["cmd", "/C", "ping 127.0.0.1 -n 30 > NUL"]
+timeout_seconds = 1
+"#,
+    );
+    let started = std::time::Instant::now();
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-command", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(started.elapsed() < std::time::Duration::from_secs(7));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "failed");
+    assert_eq!(value["results"][0]["reason"], "timed_out");
+}
+
 #[cfg(unix)]
 #[test]
 fn command_output_limit_is_a_check_error_without_retaining_output() {
@@ -281,6 +310,46 @@ command = ["sh", "-c", "sleep 30 & echo $! > child.pid; wait"]
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn second_interrupt_does_not_wait_for_command_cleanup() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "slow"
+type = "command"
+name = "Slow"
+command = ["sh", "-c", "sleep 30 & echo $! > child.pid; wait"]
+"#,
+    );
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_prepo"))
+        .current_dir(directory.path())
+        .args(["check", "--allow-command"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let child_pid_path = directory.path().join("child.pid");
+    for _ in 0..20 {
+        if child_pid_path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let started = std::time::Instant::now();
+    for _ in 0..2 {
+        std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
 #[test]
 fn active_check_without_permission_is_not_executed_and_is_not_ready() {
     let directory = write_config(
@@ -333,4 +402,262 @@ expected = "available"
         .unwrap();
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_ne!(value["results"][0]["reason"], "port_name_resolution_failed");
+}
+
+#[test]
+fn http_dns_failure_has_a_dedicated_reason() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "unresolvable"
+type = "http"
+name = "Unresolvable host"
+url = "http://prepo-invalid-host.invalid/"
+timeout_seconds = 3
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-network", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "failed");
+    assert_eq!(value["results"][0]["reason"], "dns_resolution_failed");
+}
+
+#[test]
+fn http_header_expansion_rejects_control_characters_without_sending_a_request() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "header"
+type = "http"
+name = "Header"
+url = "http://127.0.0.1:9/"
+[checks.headers]
+Authorization = "Bearer ${PREPO_TEST_HEADER_VALUE}"
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("PREPO_TEST_HEADER_VALUE", "bad\nvalue")
+        .args([
+            "check",
+            "--allow-network",
+            "--allow-env",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "error");
+    assert_eq!(
+        value["results"][0]["reason"],
+        "invalid_expanded_header_value"
+    );
+}
+
+#[test]
+fn environment_value_check_requires_permission_and_passes_when_granted() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "configured-environment"
+type = "env"
+name = "Configured environment"
+variable = "PREPO_TEST_ENVIRONMENT"
+condition = "equals"
+expected = "ready"
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .env("PREPO_TEST_ENVIRONMENT", "ready")
+        .args(["check", "--allow-env", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "passed");
+    assert_eq!(value["results"][0]["reason"], Value::Null);
+}
+
+#[test]
+fn stopped_process_check_passes_without_process_details() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "absent-process"
+type = "process"
+name = "Absent process"
+process = "prepo-this-process-does-not-exist"
+expected = "stopped"
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "passed");
+}
+
+#[test]
+fn open_port_check_uses_a_local_tcp_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let directory = write_config(&format!(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "listener"
+type = "port"
+name = "Listener"
+host = "127.0.0.1"
+port = {port}
+expected = "open"
+"#
+    ));
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-network", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "passed");
+    drop(listener);
+}
+
+#[test]
+fn http_check_matches_a_local_response_body() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        use std::io::{Read, Write};
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .unwrap();
+    });
+    let directory = write_config(&format!(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "health"
+type = "http"
+name = "Health"
+url = "http://127.0.0.1:{port}/health"
+expected_status = 200
+body_contains = "ok"
+"#
+    ));
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-network", "--format", "json"])
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "passed");
+}
+
+#[test]
+fn http_invalid_gzip_body_reports_a_decode_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        use std::io::{Read, Write};
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 7\r\nConnection: close\r\n\r\ninvalid",
+            )
+            .unwrap();
+    });
+    let directory = write_config(&format!(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "gzip"
+type = "http"
+name = "Gzip"
+url = "http://127.0.0.1:{port}/"
+body_contains = "ok"
+"#
+    ));
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-network", "--format", "json"])
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "error");
+    assert_eq!(value["results"][0]["reason"], "body_decode_failed");
+}
+
+#[test]
+fn markdown_output_escapes_configured_table_content() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example | project"
+[[checks]]
+id = "marker"
+type = "path"
+name = "Marker | *safe*"
+path = "."
+expected = "exists"
+kind = "directory"
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--format", "markdown"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let markdown = String::from_utf8(output.stdout).unwrap();
+    assert!(markdown.contains("example \\| project"));
+    assert!(markdown.contains("Marker \\| \\*safe\\*"));
 }

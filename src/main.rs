@@ -3,6 +3,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
+mod checks;
 mod config;
 mod engine;
 mod output;
@@ -147,14 +148,18 @@ fn check(
         sequential,
     )) {
         Ok(run) => run,
-        Err(Err(Interrupted::CtrlC)) => {
-            engine::terminate_active_commands();
+        Err(Err(Interrupted::CtrlC { cleanup_failed })) => {
+            if cleanup_failed {
+                eprintln!("warning: command cleanup may have failed");
+            }
             eprintln!("Interrupted.");
             return 130;
         }
         #[cfg(unix)]
-        Err(Err(Interrupted::Sigterm)) => {
-            engine::terminate_active_commands();
+        Err(Err(Interrupted::Sigterm { cleanup_failed })) => {
+            if cleanup_failed {
+                eprintln!("warning: command cleanup may have failed");
+            }
             eprintln!("Interrupted.");
             return 143;
         }
@@ -186,9 +191,13 @@ fn check(
 }
 
 enum Interrupted {
-    CtrlC,
+    CtrlC {
+        cleanup_failed: bool,
+    },
     #[cfg(unix)]
-    Sigterm,
+    Sigterm {
+        cleanup_failed: bool,
+    },
 }
 
 async fn run_until_interrupted(
@@ -201,19 +210,44 @@ async fn run_until_interrupted(
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).map_err(|_| Err(Interrupted::Sigterm))?;
+        let mut sigterm = signal(SignalKind::terminate()).map_err(|_| {
+            Err(Interrupted::Sigterm {
+                cleanup_failed: true,
+            })
+        })?;
         tokio::select! {
             run = engine::run(config, ids, group, permissions, sequential) => run.map_err(Ok),
-            _ = tokio::signal::ctrl_c() => { engine::terminate_active_commands(); Err(Err(Interrupted::CtrlC)) },
-            _ = sigterm.recv() => { engine::terminate_active_commands(); Err(Err(Interrupted::Sigterm)) },
+            _ = tokio::signal::ctrl_c() => {
+                let cleanup_failed = wait_for_cleanup_or_second_signal(&mut sigterm).await;
+                Err(Err(Interrupted::CtrlC { cleanup_failed }))
+            },
+            _ = sigterm.recv() => {
+                let cleanup_failed = wait_for_cleanup_or_second_signal(&mut sigterm).await;
+                Err(Err(Interrupted::Sigterm { cleanup_failed }))
+            },
         }
     }
     #[cfg(not(unix))]
     {
         tokio::select! {
             run = engine::run(config, ids, group, permissions, sequential) => run.map_err(Ok),
-            _ = tokio::signal::ctrl_c() => { engine::terminate_active_commands(); Err(Err(Interrupted::CtrlC)) },
+            _ = tokio::signal::ctrl_c() => {
+                let cleanup_failed = engine::terminate_active_commands().await.is_err();
+                Err(Err(Interrupted::CtrlC { cleanup_failed }))
+            },
         }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_cleanup_or_second_signal(sigterm: &mut tokio::signal::unix::Signal) -> bool {
+    engine::begin_terminate_active_commands();
+    let cleanup = engine::terminate_active_commands();
+    tokio::pin!(cleanup);
+    tokio::select! {
+        result = &mut cleanup => result.is_err(),
+        _ = tokio::signal::ctrl_c() => false,
+        _ = sigterm.recv() => false,
     }
 }
 
