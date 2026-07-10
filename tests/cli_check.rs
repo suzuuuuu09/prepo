@@ -144,6 +144,36 @@ timeout_seconds = 1
 
 #[cfg(unix)]
 #[test]
+fn command_output_limit_is_a_check_error_without_retaining_output() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "large-output"
+type = "command"
+name = "Large output"
+command = ["sh", "-c", "dd if=/dev/zero bs=1048576 count=9 2>/dev/null"]
+timeout_seconds = 5
+"#,
+    );
+    let started = std::time::Instant::now();
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-command", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "error");
+    assert_eq!(value["results"][0]["reason"], "observation_limit_exceeded");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\0"));
+}
+
+#[cfg(unix)]
+#[test]
 fn independent_checks_run_in_parallel_unless_sequential_is_requested() {
     let directory = write_config(
         r#"version = 1
