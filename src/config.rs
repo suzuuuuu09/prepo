@@ -122,7 +122,7 @@ struct RawCheck {
     timeout_seconds: Option<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ValidatedConfig {
     pub path: PathBuf,
     pub project_name: String,
@@ -130,14 +130,14 @@ pub struct ValidatedConfig {
     pub checks: Vec<Check>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Runner {
     pub parallel: bool,
     pub max_concurrency: usize,
     pub default_timeout_seconds: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Check {
     pub id: String,
     pub name: String,
@@ -149,7 +149,7 @@ pub struct Check {
     pub spec: CheckSpec,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum CheckSpec {
     Env {
         variable: String,

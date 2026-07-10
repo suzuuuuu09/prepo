@@ -91,7 +91,7 @@ fn main() {
 fn check(
     config_path: Option<PathBuf>,
     format: FormatArg,
-    _sequential: bool,
+    sequential: bool,
     no_color: bool,
     allow_command: bool,
     allow_network: bool,
@@ -134,22 +134,35 @@ fn check(
             return 3;
         }
     };
-    let run = match runtime.block_on(engine::run(
+    let permissions = engine::Permissions {
+        command: allow_command,
+        network: allow_network,
+        env: allow_env,
+    };
+    let run = match runtime.block_on(run_until_interrupted(
         &config,
         &ids,
         group.as_deref(),
-        engine::Permissions {
-            command: allow_command,
-            network: allow_network,
-            env: allow_env,
-        },
+        permissions,
+        sequential,
     )) {
         Ok(run) => run,
-        Err(engine::SelectionError::UnknownId(id)) => {
+        Err(Err(Interrupted::CtrlC)) => {
+            engine::terminate_active_commands();
+            eprintln!("Interrupted.");
+            return 130;
+        }
+        #[cfg(unix)]
+        Err(Err(Interrupted::Sigterm)) => {
+            engine::terminate_active_commands();
+            eprintln!("Interrupted.");
+            return 143;
+        }
+        Err(Ok(engine::SelectionError::UnknownId(id))) => {
             eprintln!("error: unknown check ID: {id}");
             return 4;
         }
-        Err(engine::SelectionError::EmptyGroup(group)) => {
+        Err(Ok(engine::SelectionError::EmptyGroup(group))) => {
             eprintln!("error: group has no checks: {group}");
             return 4;
         }
@@ -168,6 +181,38 @@ fn check(
         Err(_) => {
             eprintln!("error: cannot write output");
             3
+        }
+    }
+}
+
+enum Interrupted {
+    CtrlC,
+    #[cfg(unix)]
+    Sigterm,
+}
+
+async fn run_until_interrupted(
+    config: &config::ValidatedConfig,
+    ids: &[String],
+    group: Option<&str>,
+    permissions: engine::Permissions,
+    sequential: bool,
+) -> Result<engine::Run, Result<engine::SelectionError, Interrupted>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).map_err(|_| Err(Interrupted::Sigterm))?;
+        tokio::select! {
+            run = engine::run(config, ids, group, permissions, sequential) => run.map_err(Ok),
+            _ = tokio::signal::ctrl_c() => { engine::terminate_active_commands(); Err(Err(Interrupted::CtrlC)) },
+            _ = sigterm.recv() => { engine::terminate_active_commands(); Err(Err(Interrupted::Sigterm)) },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            run = engine::run(config, ids, group, permissions, sequential) => run.map_err(Ok),
+            _ = tokio::signal::ctrl_c() => { engine::terminate_active_commands(); Err(Err(Interrupted::CtrlC)) },
         }
     }
 }

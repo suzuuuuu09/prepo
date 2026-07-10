@@ -6,6 +6,7 @@ use regex::Regex;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
@@ -73,73 +74,115 @@ pub enum SelectionError {
     EmptyGroup(String),
 }
 
+#[cfg(unix)]
+static ACTIVE_COMMAND_GROUPS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<i32>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(unix)]
+struct ActiveCommandGroup(Option<i32>);
+
+#[cfg(unix)]
+impl ActiveCommandGroup {
+    fn register(process_id: Option<u32>) -> Self {
+        let process_id = process_id.and_then(|id| i32::try_from(id).ok());
+        if let Some(process_id) = process_id {
+            ACTIVE_COMMAND_GROUPS
+                .get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+                .lock()
+                .expect("active command registry poisoned")
+                .insert(process_id);
+        }
+        Self(process_id)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ActiveCommandGroup {
+    fn drop(&mut self) {
+        if let Some(process_id) = self.0 {
+            if let Some(groups) = ACTIVE_COMMAND_GROUPS.get() {
+                if let Ok(mut groups) = groups.lock() {
+                    groups.remove(&process_id);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+pub fn terminate_active_commands() {
+    let groups = ACTIVE_COMMAND_GROUPS
+        .get()
+        .and_then(|groups| groups.lock().ok().map(|groups| groups.clone()))
+        .unwrap_or_default();
+    for group in groups {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(group),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+pub fn terminate_active_commands() {}
+
 pub async fn run(
     config: &ValidatedConfig,
     ids: &[String],
     group: Option<&str>,
     permissions: Permissions,
+    sequential: bool,
 ) -> Result<Run, SelectionError> {
-    let _runner_settings = (
-        config.runner.parallel,
-        config.runner.max_concurrency,
-        config.runner.default_timeout_seconds,
-    );
     let full = ids.is_empty() && group.is_none();
+    debug_assert!((1..=3600).contains(&config.runner.default_timeout_seconds));
     let explicit = select(config, ids, group)?;
     let selected = include_dependencies(config, &explicit);
     let started = Instant::now();
     let current_platform = Platform::current().expect("unsupported OS is checked by the CLI");
+    let config = Arc::new(config.clone());
     let mut rows: Vec<Option<ResultRow>> = (0..config.checks.len()).map(|_| None).collect();
     let mut remaining: BTreeSet<usize> = selected.clone();
-    while !remaining.is_empty() {
-        let index = *remaining.iter().next().expect("not empty");
-        let check = &config.checks[index];
-        if check
-            .depends_on
-            .iter()
-            .all(|dependency| rows[*dependency].is_some())
-        {
-            rows[index] = Some(
-                run_one(
-                    config,
-                    index,
-                    check,
-                    &rows,
-                    current_platform,
-                    explicit.contains(&index),
-                    full,
-                    permissions,
-                )
-                .await,
-            );
-            remaining.remove(&index);
-        } else {
-            // Validated configurations are acyclic; this only guards against an internal invariant break.
-            let candidate = remaining.iter().copied().find(|candidate| {
+    let concurrency = if sequential || !config.runner.parallel {
+        1
+    } else {
+        config.runner.max_concurrency
+    };
+    let mut tasks = tokio::task::JoinSet::new();
+    while !remaining.is_empty() || !tasks.is_empty() {
+        while tasks.len() < concurrency {
+            let Some(index) = remaining.iter().copied().find(|candidate| {
                 config.checks[*candidate]
                     .depends_on
                     .iter()
                     .all(|dependency| rows[*dependency].is_some())
-            });
-            if let Some(candidate) = candidate {
-                let check = &config.checks[candidate];
-                rows[candidate] = Some(
-                    run_one(
-                        config,
-                        candidate,
-                        check,
-                        &rows,
-                        current_platform,
-                        explicit.contains(&candidate),
-                        full,
-                        permissions,
-                    )
-                    .await,
-                );
-                remaining.remove(&candidate);
-            } else {
+            }) else {
                 break;
-            }
+            };
+            let config = Arc::clone(&config);
+            let row_snapshot = rows.clone();
+            let is_explicit = explicit.contains(&index);
+            tasks.spawn(async move {
+                let check = &config.checks[index];
+                let result = run_one(
+                    &config,
+                    index,
+                    check,
+                    &row_snapshot,
+                    current_platform,
+                    is_explicit,
+                    full,
+                    permissions,
+                )
+                .await;
+                (index, result)
+            });
+            remaining.remove(&index);
+        }
+        if let Some(joined) = tasks.join_next().await {
+            let (index, result) = joined.expect("check task must not panic");
+            rows[index] = Some(result);
+        } else {
+            break;
         }
     }
     let results = rows.into_iter().flatten().collect::<Vec<_>>();
@@ -603,7 +646,10 @@ async fn execute_command(
                 .join(working_directory.unwrap_or(".")),
         )
         .envs(env);
-    let child = match child.spawn() {
+    if let Err(reason) = configure_command_containment(&mut child) {
+        return error(reason);
+    }
+    let mut child = match child.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return fail("command_not_found");
@@ -613,37 +659,258 @@ async fn execute_command(
         }
         Err(_) => return fail("working_directory_invalid"),
     };
-    match tokio::time::timeout(
-        Duration::from_secs(timeout_seconds),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Err(_) => fail("timed_out"),
-        Ok(Err(_)) => error("command_output_read_failed"),
-        Ok(Ok(output)) => {
-            if output.stdout.len() > 8 * 1024 * 1024 || output.stderr.len() > 8 * 1024 * 1024 {
-                return error("observation_limit_exceeded");
-            }
-            if !output.status.success() && output.status.code().is_none() {
-                return fail("command_terminated");
-            }
-            if output.status.code() != Some(expected_exit_code) {
-                return fail("exit_code_mismatch");
-            }
-            if let Some(pattern) = stdout_contains {
-                if !contains(&output.stdout, pattern) {
-                    return fail("stdout_condition_mismatch");
-                }
-            }
-            if let Some(pattern) = stderr_not_contains {
-                if contains(&output.stderr, pattern) {
-                    return fail("stderr_condition_mismatch");
-                }
-            }
-            pass()
+    let containment = match establish_command_containment(&child) {
+        Ok(containment) => containment,
+        Err(reason) => return error(reason),
+    };
+    let process_id = child.id();
+    #[cfg(unix)]
+    let _active_group = ActiveCommandGroup::register(process_id);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut wait = Box::pin(child.wait());
+    let mut observations = Box::pin(async {
+        tokio::try_join!(
+            observe_stream(stdout, stdout_contains),
+            observe_stream(stderr, stderr_not_contains),
+        )
+    });
+    enum CommandEvent {
+        Exited(Result<std::process::ExitStatus, std::io::Error>),
+        Observed(Result<(Observation, Observation), ObserveError>),
+    }
+    let event = tokio::time::timeout(Duration::from_secs(timeout_seconds), async {
+        tokio::select! {
+            status = &mut wait => CommandEvent::Exited(status),
+            observation = &mut observations => CommandEvent::Observed(observation),
+        }
+    })
+    .await;
+    match event {
+        Err(_) => match terminate_command_tree(process_id, &containment) {
+            Ok(()) => fail("timed_out"),
+            Err(()) => error("command_cleanup_failed"),
+        },
+        Ok(CommandEvent::Observed(Err(ObserveError::LimitExceeded))) => {
+            let _ = terminate_command_tree(process_id, &containment);
+            error("observation_limit_exceeded")
+        }
+        Ok(CommandEvent::Observed(Err(ObserveError::ReadFailed))) => {
+            let _ = terminate_command_tree(process_id, &containment);
+            error("command_output_read_failed")
+        }
+        Ok(CommandEvent::Exited(Err(_))) => error("command_runtime_failed"),
+        Ok(CommandEvent::Exited(Ok(status))) => match observations.await {
+            Err(ObserveError::LimitExceeded) => error("observation_limit_exceeded"),
+            Err(ObserveError::ReadFailed) => error("command_output_read_failed"),
+            Ok((stdout, stderr)) => evaluate_command(
+                status,
+                expected_exit_code,
+                stdout_contains,
+                stderr_not_contains,
+                stdout,
+                stderr,
+            ),
+        },
+        Ok(CommandEvent::Observed(Ok((stdout, stderr)))) => match wait.await {
+            Err(_) => error("command_runtime_failed"),
+            Ok(status) => evaluate_command(
+                status,
+                expected_exit_code,
+                stdout_contains,
+                stderr_not_contains,
+                stdout,
+                stderr,
+            ),
+        },
+    }
+}
+
+fn evaluate_command(
+    status: std::process::ExitStatus,
+    expected_exit_code: i32,
+    stdout_contains: Option<&[u8]>,
+    stderr_not_contains: Option<&[u8]>,
+    stdout: Observation,
+    stderr: Observation,
+) -> (Outcome, Option<&'static str>, String) {
+    if !status.success() && status.code().is_none() {
+        return fail("command_terminated");
+    }
+    if status.code() != Some(expected_exit_code) {
+        return fail("exit_code_mismatch");
+    }
+    if stdout_contains.is_some() && !stdout.matched {
+        return fail("stdout_condition_mismatch");
+    }
+    if stderr_not_contains.is_some() && stderr.matched {
+        return fail("stderr_condition_mismatch");
+    }
+    pass()
+}
+
+struct CommandContainment {
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for CommandContainment {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.job);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct Observation {
+    matched: bool,
+}
+
+enum ObserveError {
+    LimitExceeded,
+    ReadFailed,
+}
+
+async fn observe_stream<R>(
+    mut reader: Option<R>,
+    pattern: Option<&[u8]>,
+) -> Result<Observation, ObserveError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(reader) = reader.as_mut() else {
+        return Ok(Observation { matched: false });
+    };
+    let mut total = 0_usize;
+    let mut matched = false;
+    let mut tail = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|_| ObserveError::ReadFailed)?;
+        if count == 0 {
+            return Ok(Observation { matched });
+        }
+        total += count;
+        if total > 8 * 1024 * 1024 {
+            return Err(ObserveError::LimitExceeded);
+        }
+        if let Some(pattern) = pattern {
+            let mut candidate = Vec::with_capacity(tail.len() + count);
+            candidate.extend_from_slice(&tail);
+            candidate.extend_from_slice(&buffer[..count]);
+            matched |= contains(&candidate, pattern);
+            let tail_length = pattern.len().saturating_sub(1).min(candidate.len());
+            tail = candidate[candidate.len() - tail_length..].to_vec();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_command_containment(
+    command: &mut tokio::process::Command,
+) -> Result<(), &'static str> {
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn establish_command_containment(
+    _child: &tokio::process::Child,
+) -> Result<CommandContainment, &'static str> {
+    Ok(CommandContainment {})
+}
+
+#[cfg(windows)]
+fn configure_command_containment(
+    _command: &mut tokio::process::Command,
+) -> Result<(), &'static str> {
+    // Windows containment is installed after spawning by the Job Object path.
+    Ok(())
+}
+
+#[cfg(windows)]
+fn establish_command_containment(
+    child: &tokio::process::Child,
+) -> Result<CommandContainment, &'static str> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    let raw = child.raw_handle().ok_or("command_containment_failed")? as HANDLE;
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err("command_containment_failed");
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            std::mem::size_of_val(&limits) as u32,
+        ) != 0;
+        let assigned = configured && AssignProcessToJobObject(job, raw) != 0;
+        if !assigned {
+            CloseHandle(job);
+            return Err("command_containment_failed");
+        }
+        Ok(CommandContainment { job })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_command_containment(
+    _command: &mut tokio::process::Command,
+) -> Result<(), &'static str> {
+    Err("command_containment_failed")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn establish_command_containment(
+    _child: &tokio::process::Child,
+) -> Result<CommandContainment, &'static str> {
+    Err("command_containment_failed")
+}
+
+#[cfg(unix)]
+fn terminate_command_tree(
+    process_id: Option<u32>,
+    _containment: &CommandContainment,
+) -> Result<(), ()> {
+    let process_id = process_id.ok_or(())?;
+    nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(process_id.try_into().map_err(|_| ())?),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .map_err(|_| ())
+}
+
+#[cfg(windows)]
+fn terminate_command_tree(
+    _process_id: Option<u32>,
+    containment: &CommandContainment,
+) -> Result<(), ()> {
+    let _ = containment;
+    // Dropping the Job Object closes it and applies KILL_ON_JOB_CLOSE.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_command_tree(
+    _process_id: Option<u32>,
+    _containment: &CommandContainment,
+) -> Result<(), ()> {
+    Err(())
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -705,17 +972,38 @@ async fn execute_http(
     let Some(pattern) = body_contains else {
         return pass();
     };
-    match response.bytes().await {
-        Ok(body) if body.len() <= 1024 * 1024 => {
-            if contains(&body, pattern) {
-                pass()
-            } else {
-                fail("http_body_mismatch")
-            }
-        }
-        Ok(_) => error("observation_limit_exceeded"),
-        Err(_) => error("http_body_read_failed"),
+    match observe_http_body(response, pattern).await {
+        Ok(true) => pass(),
+        Ok(false) => fail("http_body_mismatch"),
+        Err(ObserveError::LimitExceeded) => error("observation_limit_exceeded"),
+        Err(ObserveError::ReadFailed) => error("http_body_read_failed"),
     }
+}
+
+async fn observe_http_body(
+    mut response: reqwest::Response,
+    pattern: &[u8],
+) -> Result<bool, ObserveError> {
+    let mut total = 0_usize;
+    let mut matched = false;
+    let mut tail = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ObserveError::ReadFailed)?
+    {
+        total += chunk.len();
+        if total > 1024 * 1024 {
+            return Err(ObserveError::LimitExceeded);
+        }
+        let mut candidate = Vec::with_capacity(tail.len() + chunk.len());
+        candidate.extend_from_slice(&tail);
+        candidate.extend_from_slice(&chunk);
+        matched |= contains(&candidate, pattern);
+        let tail_length = pattern.len().saturating_sub(1).min(candidate.len());
+        tail = candidate[candidate.len() - tail_length..].to_vec();
+    }
+    Ok(matched)
 }
 
 fn expand_header(value: &str) -> Result<String, (Outcome, Option<&'static str>, String)> {
