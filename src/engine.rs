@@ -567,7 +567,11 @@ async fn execute_port(
             Err(_) => error("port_bind_failed"),
         };
     }
-    let address = format!("{host}:{port}");
+    let address = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let addresses = match tokio::net::lookup_host(&address).await {
         Ok(addresses) => addresses.collect::<Vec<_>>(),
         Err(_) => {

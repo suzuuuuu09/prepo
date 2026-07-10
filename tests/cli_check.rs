@@ -309,3 +309,28 @@ url = "http://127.0.0.1:9"
         "--allow-network"
     );
 }
+
+#[test]
+fn available_port_accepts_a_loopback_ipv6_host() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "available-ipv6"
+type = "port"
+name = "Available IPv6 port"
+host = "::1"
+port = 0
+expected = "available"
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-network", "--format", "json"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(value["results"][0]["reason"], "port_name_resolution_failed");
+}
