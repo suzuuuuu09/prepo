@@ -166,7 +166,7 @@ required = false
 | platforms | いいえ | 全対応 OS | 適用条件 |
 | help | いいえ | なし | 安全な単一行の修正案 |
 
-id と group は ASCII kebab-case とする。name と help は Unicode を許可するが、空白のみ、改行、ASCII/C1 制御文字、ANSI ESC、Unicode 双方向上書き制御文字、前後の空白を拒否する。
+id と group は ASCII kebab-case とする。project.name、name、help は Unicode を許可するが、空白のみ、改行、ASCII/C1 制御文字、ANSI ESC、Unicode 双方向上書き制御文字、前後の空白を拒否する。project.name と name の上限は 256 バイト、help の上限は 2,048 バイトである。
 
 RawConfig は入力表現、ValidatedConfig は既定値、正規化済みプラットフォーム、コンパイル済み正規表現、検証済み依存関係を持つ内部表現である。実行器は ValidatedConfig だけを受け取る。
 
@@ -266,6 +266,7 @@ TCP のみを扱う。
 - available はローカル bind 成功後ただちに解放できたとき Passed、使用中なら Failed、権限不足等は Error。
 - available の host は 127.0.0.1、::1、0.0.0.0、:: だけを許可する。
 - available はポートを予約せず、検査時点のスナップショットである。
+- timeout_seconds は expected が open または closed のときだけ指定できる。available に指定した場合は validate エラーである。
 
 ### 7.6 http
 
@@ -299,7 +300,8 @@ ID 列挙または group は Partial Run である。全体の readiness を判�
 
 - 選択した ID の和集合、または一つの group が Explicit Check。
 - 依存先は再帰的に自動追加し、Dependency Check とする。明示選択も依存先である場合は explicit を優先する。
-- 不明 ID、空 group、重複 ID、ID と group の併用は終了コード 4 であり、何も実行しない。
+- 重複 ID と ID 列挙・group の併用は CLI 構文エラー（終了コード 2）であり、何も実行しない。
+- 不明 ID または空 group は選択対象エラー（終了コード 4）であり、何も実行しない。
 - 全ての Explicit Check が Not Applicable なら Selected run: Not Evaluated として終了コード 0。
 - それ以外は実行範囲の必須チェックから Selected run: Passed | Failed を導出する。
 
@@ -314,7 +316,7 @@ ID 列挙または group は Partial Run である。全体の readiness を判�
 
 既定は並列であり、max_concurrency の既定値は 4、許容範囲は 1..=64。runner.parallel = false または sequential で逐次実行し、CLI 指定が優先する。依存関係が解決したチェックは設定の宣言順で起動し、結果、group、JSON、Markdown は完了順ではなく宣言順で出す。
 
-個別 timeout は command、port、http だけが指定できる。既定は runner.default_timeout_seconds = 10、範囲は 1..=3600 秒。timeout は実行開始から測り、timeout 自体は Failed / timed_out、後処理失敗は Error。env、path、process の timeout 指定は validate エラー。fail-fast は実装しない。
+個別 timeout は command、port、http だけが指定できる。既定は runner.default_timeout_seconds = 10、範囲は 1..=3600 秒。timeout は実行開始から測る。command と http の timeout、および expected = open の port timeout は Failed / timed_out である。expected = closed の port timeout は、閉じていると断定できないため Error / connection_state_indeterminate である。後処理失敗は Error。env、path、process の timeout 指定は validate エラー。fail-fast は実装しない。
 
 ### 8.3 中断
 
@@ -353,7 +355,41 @@ Blocked
 
 Error はチェック単位の判定不能であり、他のチェックは継続する。Prepo Error は診断全体を信頼して継続できない内部障害であり、Check Outcome ではない。必須の Failed/Error/PermissionDenied/Blocked は表示上 Failed、任意の同結果は Warning となる。
 
-reason は閉じた機械可読 enum である。Rust では PascalCase、JSON では snake_case を使う。Passed の reason は null、他は非 null。例は permission_missing、platform_not_applicable、dependency_not_passed、non_unicode_environment_value、broken_symlink、timed_out、observation_limit_exceeded、unsupported_content_encoding、expanded_header_too_large である。OS やライブラリの生エラー文を reason に入れない。同じ output_schema_version 内で既存 reason の意味を変更・削除しない。
+reason は閉じた機械可読 enum である。Rust では PascalCase、JSON では snake_case を使う。Passed の reason は null、他は非 null。OS やライブラリの生エラー文を reason に入れない。同じ output_schema_version 内で既存 reason の意味を変更・削除しない。
+
+### 10.1 Outcome と reason の完全な対応表
+
+全チェックに共通する対応は次の通りである。
+
+| Outcome | reason | 条件 |
+| --- | --- | --- |
+| Passed | null | 種別固有の期待条件を満たした |
+| PermissionDenied | permission_missing | 必要な許可フラグが一つ以上不足した |
+| NotApplicable | platform_not_applicable | 現在の OS が適用条件を満たさない |
+| Blocked | dependency_not_passed | 直接依存先が Passed 以外である |
+
+種別固有の Failed と Error は次の表に限定する。
+
+| 種別 | Outcome | reason |
+| --- | --- | --- |
+| env | Failed | environment_variable_missing, environment_variable_present, environment_value_mismatch, environment_value_forbidden, environment_substring_missing, environment_pattern_mismatch |
+| env | Error | non_unicode_environment_value, environment_read_failed |
+| path | Failed | path_missing, path_present, path_kind_mismatch, broken_symlink |
+| path | Error | path_metadata_failed, symlink_loop |
+| command | Failed | command_not_found, command_not_executable, working_directory_invalid, timed_out, command_terminated, exit_code_mismatch, stdout_condition_mismatch, stderr_condition_mismatch |
+| command | Error | command_containment_failed, command_cleanup_failed, command_output_read_failed, command_runtime_failed, observation_limit_exceeded |
+| process | Failed | process_not_running, process_unexpectedly_running |
+| process | Error | process_enumeration_failed |
+| port expected=open | Failed | port_not_open, timed_out |
+| port expected=open | Error | port_name_resolution_failed, port_connect_failed |
+| port expected=closed | Failed | port_not_closed |
+| port expected=closed | Error | connection_state_indeterminate |
+| port expected=available | Failed | port_unavailable |
+| port expected=available | Error | port_bind_failed |
+| http | Failed | dns_resolution_failed, http_connection_failed, tls_validation_failed, timed_out, http_status_mismatch, http_body_mismatch, missing_environment_variable |
+| http | Error | http_client_build_failed, http_body_read_failed, body_decode_failed, unsupported_content_encoding, invalid_expanded_header_value, expanded_header_too_large, non_unicode_environment_value, http_runtime_failed, observation_limit_exceeded |
+
+環境値条件で変数が未設定の場合は environment_variable_missing である。env の exists が失敗した場合も同じ reason、not_exists が失敗した場合は environment_variable_present を使う。expected = closed の port では接続拒否だけが Passed であり、timeout、名前解決失敗、到達不能、その他の接続失敗は connection_state_indeterminate とする。PermissionDenied の missing_permissions は、CLI で入力する --allow-command、--allow-network、--allow-env の文字列配列であり、宣言済みのこの順序で重複なく出す。
 
 | 終了コード | 意味 |
 | ---: | --- |
@@ -381,9 +417,9 @@ JSON は stdout に JSON だけを出す。表示上の Warning/Failed を保存
 
 トップレベルは output_schema_version、config_schema_version、prepo_version、run_kind、Full Run 時だけの readiness、project.name、environment.os、environment.arch、total_duration_ms、summary、results を持つ。
 
-summary は total_count、applicable_count、evaluated_count、evaluated_required_count と各 Outcome の件数を持つ。evaluated_count は Passed、Failed、Error だけを数える。各 Outcome 件数の合計は total_count である。
+summary は total_count、applicable_count、evaluated_count、evaluated_required_count と各 Outcome の件数を持つ。total_count は当該 Run の結果配列長、applicable_count は outcome が not_applicable 以外の件数、evaluated_count は Passed、Failed、Error の件数、evaluated_required_count は required = true かつ Passed、Failed、Error の件数である。PermissionDenied と Blocked は評価を実行していないため evaluated 系の値へ含めない。各 Outcome 件数の合計は total_count である。total_duration_ms は、実行計画の開始から全チェックの完了または後処理完了までを単調時計で測った実時間であり、各 duration_ms の合計ではない。
 
-各結果は id、name、group、required、outcome、reason、安全な summary、help、duration_ms、blocked_by、missing_permissions を持つ。Partial Run のみ selection: explicit | dependency を持ち、Full Run では selection を省略する。Passed の reason は null、blocked_by と missing_permissions は該当しない場合も空配列である。日時、タイムゾーン、ホスト名、ユーザー名、現在ディレクトリ、絶対パスを含めない。
+各結果は id、name、group、required、outcome、reason、安全な summary、help、duration_ms、blocked_by、missing_permissions を持つ。group と help は常にフィールドを出し、未設定なら null とする。Partial Run のみ selection: explicit | dependency を持ち、Full Run では selection を省略する。Passed の reason は null、blocked_by と missing_permissions は該当しない場合も空配列である。日時、タイムゾーン、ホスト名、ユーザー名、現在ディレクトリ、絶対パスを含めない。
 
 ### 11.3 Markdown
 
