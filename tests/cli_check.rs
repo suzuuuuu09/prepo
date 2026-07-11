@@ -204,6 +204,7 @@ timeout_seconds = 5
     let output = Command::cargo_bin("prepo")
         .unwrap()
         .current_dir(directory.path())
+        .env("PREPO_TEST_DEBUG_CLEANUP", "1")
         .args(["check", "--allow-command", "--format", "json"])
         .output()
         .unwrap();

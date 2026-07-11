@@ -50,7 +50,7 @@ impl Drop for ActiveCommandGroup {
 #[cfg(unix)]
 pub(crate) fn begin_terminate_active_commands() -> Result<BTreeSet<i32>, ()> {
     let groups = active_command_groups();
-    signal_process_groups(&groups)?;
+    signal_process_groups(&groups).map_err(|_| ())?;
     Ok(groups)
 }
 
@@ -68,8 +68,8 @@ fn active_command_groups() -> BTreeSet<i32> {
 }
 
 #[cfg(unix)]
-fn signal_process_groups(groups: &BTreeSet<i32>) -> Result<(), ()> {
-    let mut failed = false;
+fn signal_process_groups(groups: &BTreeSet<i32>) -> Result<(), nix::errno::Errno> {
+    let mut first_error = None;
     for group in groups {
         let mut interrupted = 0;
         let result = loop {
@@ -86,10 +86,12 @@ fn signal_process_groups(groups: &BTreeSet<i32>) -> Result<(), ()> {
         };
         match result {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(_) => failed = true,
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
-    if failed { Err(()) } else { Ok(()) }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(not(unix))]
@@ -698,15 +700,44 @@ async fn terminate_command_tree<F>(
 where
     F: std::future::Future<Output = Result<std::process::ExitStatus, std::io::Error>> + Send,
 {
-    let process_id = process_id.ok_or(())?.try_into().map_err(|_| ())?;
+    let process_id = process_id.ok_or_else(|| {
+        debug_command_cleanup("missing_process_id");
+    })?;
+    let process_id = process_id.try_into().map_err(|_| {
+        debug_command_cleanup("invalid_process_id");
+    })?;
     let groups = [process_id].into_iter().collect::<BTreeSet<_>>();
-    signal_process_groups(&groups)?;
+    signal_process_groups(&groups).map_err(|error| {
+        debug_command_cleanup(signal_cleanup_stage(error));
+    })?;
     let deadline = Instant::now() + Duration::from_secs(5);
     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wait)
         .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
-    wait_for_process_groups_until(groups, deadline).await
+        .map_err(|_| {
+            debug_command_cleanup("child_wait_timed_out");
+        })?
+        .map_err(|_| {
+            debug_command_cleanup("child_wait_failed");
+        })?;
+    wait_for_process_groups_until(groups, deadline)
+        .await
+        .map_err(|_| debug_command_cleanup("group_still_running"))
+}
+
+#[cfg(unix)]
+fn debug_command_cleanup(stage: &str) {
+    if std::env::var_os("PREPO_TEST_DEBUG_CLEANUP").as_deref() == Some(OsStr::new("1")) {
+        eprintln!("[DEBUG-6b2f] command_cleanup={stage}");
+    }
+}
+
+#[cfg(unix)]
+fn signal_cleanup_stage(error: nix::errno::Errno) -> &'static str {
+    match error {
+        nix::errno::Errno::EPERM => "signal_permission_denied",
+        nix::errno::Errno::EINTR => "signal_interrupted",
+        _ => "signal_failed",
+    }
 }
 
 #[cfg(unix)]
