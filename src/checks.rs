@@ -4,6 +4,7 @@ use crate::config::{
 };
 use crate::engine::{ExecutionResult, Outcome, Reason};
 use regex::Regex;
+#[cfg(unix)]
 use std::collections::BTreeSet;
 use std::error::Error as _;
 use std::ffi::OsStr;
@@ -429,18 +430,18 @@ async fn execute_command(
     })
     .await;
     match event {
-        Err(_) => match terminate_command_tree(process_id, &containment).await {
+        Err(_) => match terminate_command_tree(process_id, &containment, wait).await {
             Ok(()) => fail(Reason::TimedOut),
             Err(()) => error(Reason::CommandCleanupFailed),
         },
         Ok(CommandEvent::Observed(Err(ObserveError::LimitExceeded))) => {
-            match terminate_command_tree(process_id, &containment).await {
+            match terminate_command_tree(process_id, &containment, wait).await {
                 Ok(()) => error(Reason::ObservationLimitExceeded),
                 Err(()) => error(Reason::CommandCleanupFailed),
             }
         }
         Ok(CommandEvent::Observed(Err(ObserveError::ReadFailed | ObserveError::DecodeFailed))) => {
-            match terminate_command_tree(process_id, &containment).await {
+            match terminate_command_tree(process_id, &containment, wait).await {
                 Ok(()) => error(Reason::CommandOutputReadFailed),
                 Err(()) => error(Reason::CommandCleanupFailed),
             }
@@ -499,16 +500,38 @@ fn evaluate_command(
 
 struct CommandContainment {
     #[cfg(windows)]
-    job: windows_sys::Win32::Foundation::HANDLE,
-    #[cfg(windows)]
-    process: windows_sys::Win32::Foundation::HANDLE,
+    job: JobHandle,
 }
 
 #[cfg(windows)]
-impl Drop for CommandContainment {
+const _: fn() = assert_send::<CommandContainment>;
+
+#[cfg(windows)]
+fn assert_send<T: Send>() {}
+
+#[cfg(windows)]
+struct JobHandle(usize);
+
+#[cfg(windows)]
+impl JobHandle {
+    fn new(raw: windows_sys::Win32::Foundation::HANDLE) -> Self {
+        Self(raw as usize)
+    }
+
+    fn as_raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0 as windows_sys::Win32::Foundation::HANDLE
+    }
+
+    fn identifier(&self) -> usize {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
     fn drop(&mut self) {
         unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.job);
+            windows_sys::Win32::Foundation::CloseHandle(self.as_raw());
         }
     }
 }
@@ -637,7 +660,9 @@ fn establish_command_containment(
             CloseHandle(job);
             return Err(Reason::CommandContainmentFailed);
         }
-        Ok(CommandContainment { job, process: raw })
+        Ok(CommandContainment {
+            job: JobHandle::new(job),
+        })
     }
 }
 
@@ -654,23 +679,33 @@ fn establish_command_containment(
 }
 
 #[cfg(unix)]
-async fn terminate_command_tree(
+async fn terminate_command_tree<F>(
     process_id: Option<u32>,
     _containment: &CommandContainment,
-) -> Result<(), ()> {
+    wait: F,
+) -> Result<(), ()>
+where
+    F: std::future::Future<Output = Result<std::process::ExitStatus, std::io::Error>> + Send,
+{
     let process_id = process_id.ok_or(())?.try_into().map_err(|_| ())?;
-    terminate_process_groups([process_id].into_iter().collect()).await
-}
-
-#[cfg(unix)]
-async fn terminate_process_groups(groups: BTreeSet<i32>) -> Result<(), ()> {
+    let groups = [process_id].into_iter().collect::<BTreeSet<_>>();
     signal_process_groups(&groups)?;
-    wait_for_process_groups(groups).await
+    let deadline = Instant::now() + Duration::from_secs(5);
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wait)
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
+    wait_for_process_groups_until(groups, deadline).await
 }
 
 #[cfg(unix)]
 async fn wait_for_process_groups(groups: BTreeSet<i32>) -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_process_groups_until(groups, deadline).await
+}
+
+#[cfg(unix)]
+async fn wait_for_process_groups_until(groups: BTreeSet<i32>, deadline: Instant) -> Result<(), ()> {
     loop {
         let running = groups.iter().any(|group| {
             nix::sys::signal::killpg(nix::unistd::Pid::from_raw(*group), None).is_ok()
@@ -686,34 +721,35 @@ async fn wait_for_process_groups(groups: BTreeSet<i32>) -> Result<(), ()> {
 }
 
 #[cfg(windows)]
-async fn terminate_command_tree(
+async fn terminate_command_tree<F>(
     _process_id: Option<u32>,
     containment: &CommandContainment,
-) -> Result<(), ()> {
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    wait: F,
+) -> Result<(), ()>
+where
+    F: std::future::Future<Output = Result<std::process::ExitStatus, std::io::Error>> + Send,
+{
     use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-    if unsafe { TerminateJobObject(containment.job, 1) } == 0 {
+    if unsafe { TerminateJobObject(containment.job.as_raw(), 1) } == 0 {
         return Err(());
     }
-    let process = containment.process;
-    let wait_result =
-        tokio::task::spawn_blocking(move || unsafe { WaitForSingleObject(process, 5_000) })
-            .await
-            .map_err(|_| ())?;
-    if wait_result == WAIT_OBJECT_0 {
-        Ok(())
-    } else {
-        Err(())
-    }
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .map_err(|_| ())?
+        .map(|_| ())
+        .map_err(|_| ())
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn terminate_command_tree(
+async fn terminate_command_tree<F>(
     _process_id: Option<u32>,
     _containment: &CommandContainment,
-) -> Result<(), ()> {
+    _wait: F,
+) -> Result<(), ()>
+where
+    F: std::future::Future<Output = Result<std::process::ExitStatus, std::io::Error>> + Send,
+{
     Err(())
 }
 
