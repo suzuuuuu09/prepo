@@ -196,7 +196,7 @@ name = "example"
 id = "large-output"
 type = "command"
 name = "Large output"
-command = ["sh", "-c", "dd if=/dev/zero bs=1048576 count=9 2>/dev/null"]
+command = ["sh", "-c", "dd if=/dev/zero bs=1048576 count=9 2>/dev/null; sleep 30"]
 timeout_seconds = 5
 "#,
     );
@@ -204,7 +204,6 @@ timeout_seconds = 5
     let output = Command::cargo_bin("prepo")
         .unwrap()
         .current_dir(directory.path())
-        .env("PREPO_TEST_DEBUG_CLEANUP", "1")
         .args(["check", "--allow-command", "--format", "json"])
         .output()
         .unwrap();
@@ -212,12 +211,7 @@ timeout_seconds = 5
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["results"][0]["outcome"], "error");
-    assert_eq!(
-        value["results"][0]["reason"],
-        "observation_limit_exceeded",
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(value["results"][0]["reason"], "observation_limit_exceeded");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("\0"));
 }
 
