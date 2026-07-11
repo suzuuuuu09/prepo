@@ -212,7 +212,12 @@ timeout_seconds = 5
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["results"][0]["outcome"], "error");
-    assert_eq!(value["results"][0]["reason"], "observation_limit_exceeded");
+    assert_eq!(
+        value["results"][0]["reason"],
+        "observation_limit_exceeded",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("\0"));
 }
 
