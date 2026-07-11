@@ -71,10 +71,20 @@ fn active_command_groups() -> BTreeSet<i32> {
 fn signal_process_groups(groups: &BTreeSet<i32>) -> Result<(), ()> {
     let mut failed = false;
     for group in groups {
-        match nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(*group),
-            nix::sys::signal::Signal::SIGKILL,
-        ) {
+        let mut interrupted = 0;
+        let result = loop {
+            match nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(*group),
+                nix::sys::signal::Signal::SIGKILL,
+            ) {
+                Err(nix::errno::Errno::EINTR) if interrupted < 2 => {
+                    interrupted += 1;
+                    continue;
+                }
+                result => break result,
+            }
+        };
+        match result {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
             Err(_) => failed = true,
         }
