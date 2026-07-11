@@ -1,0 +1,11 @@
+interface:
+  display_name: prepo
+  short_description: "Diagnose your repository's runtime environment with prepo and receive suggestions for fixes."
+  default_prompt: "Use $prepo to check if this repository can be executed in the current environment."
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
