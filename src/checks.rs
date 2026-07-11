@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::error::Error as _;
 use std::ffi::OsStr;
 use std::time::{Duration, Instant};
-use sysinfo::System;
+use sysinfo::{ProcessStatus, ProcessesToUpdate, System};
 
 #[cfg(unix)]
 static ACTIVE_COMMAND_GROUPS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<i32>>> =
@@ -37,6 +37,7 @@ impl ActiveCommandGroup {
 impl Drop for ActiveCommandGroup {
     fn drop(&mut self) {
         if let Some(process_id) = self.0 {
+            let _ = signal_process_groups(&[process_id].into_iter().collect());
             if let Some(groups) = ACTIVE_COMMAND_GROUPS.get() {
                 if let Ok(mut groups) = groups.lock() {
                     groups.remove(&process_id);
@@ -706,10 +707,9 @@ async fn wait_for_process_groups(groups: BTreeSet<i32>) -> Result<(), ()> {
 
 #[cfg(unix)]
 async fn wait_for_process_groups_until(groups: BTreeSet<i32>, deadline: Instant) -> Result<(), ()> {
+    let mut system = System::new();
     loop {
-        let running = groups.iter().any(|group| {
-            nix::sys::signal::killpg(nix::unistd::Pid::from_raw(*group), None).is_ok()
-        });
+        let running = process_groups_have_running_members(&mut system, &groups);
         if !running {
             return Ok(());
         }
@@ -718,6 +718,24 @@ async fn wait_for_process_groups_until(groups: BTreeSet<i32>, deadline: Instant)
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[cfg(unix)]
+fn process_groups_have_running_members(system: &mut System, groups: &BTreeSet<i32>) -> bool {
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.processes().iter().any(|(pid, process)| {
+        if process.status() == ProcessStatus::Zombie {
+            return false;
+        }
+        let Ok(raw_pid) = i32::try_from(pid.as_u32()) else {
+            return false;
+        };
+        let Ok(process_group) = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(raw_pid)))
+        else {
+            return false;
+        };
+        groups.contains(&process_group.as_raw())
+    })
 }
 
 #[cfg(windows)]
