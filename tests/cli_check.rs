@@ -3,6 +3,20 @@ use serde_json::Value;
 use std::fs;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+fn process_is_absent_or_zombie(pid: &str) -> bool {
+    let status = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    if !status.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&status.stdout)
+        .trim_start()
+        .starts_with('Z')
+}
+
 fn write_config(body: &str) -> tempfile::TempDir {
     let directory = tempdir().unwrap();
     fs::write(directory.path().join("prepo.toml"), body).unwrap();
@@ -298,14 +312,14 @@ command = ["sh", "-c", "sleep 30 & echo $! > child.pid; wait"]
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Interrupted."));
     let child_pid = std::fs::read_to_string(child_pid_path).unwrap();
-    let status = std::process::Command::new("kill")
-        .args(["-0", child_pid.trim()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
+    for _ in 0..20 {
+        if process_is_absent_or_zombie(child_pid.trim()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(
-        !status.success(),
+        process_is_absent_or_zombie(child_pid.trim()),
         "the command descendant must be terminated"
     );
 }
