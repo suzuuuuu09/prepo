@@ -15,6 +15,80 @@ pub enum Outcome {
     Blocked,
 }
 
+macro_rules! reason_codes {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        #[allow(dead_code)]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+        pub enum Reason {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+
+        impl Reason {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+        }
+    };
+}
+
+reason_codes! {
+    PlatformNotApplicable => "platform_not_applicable",
+    DependencyNotPassed => "dependency_not_passed",
+    PermissionMissing => "permission_missing",
+    EnvironmentVariableMissing => "environment_variable_missing",
+    EnvironmentVariablePresent => "environment_variable_present",
+    EnvironmentValueMismatch => "environment_value_mismatch",
+    EnvironmentValueForbidden => "environment_value_forbidden",
+    EnvironmentSubstringMissing => "environment_substring_missing",
+    EnvironmentPatternMismatch => "environment_pattern_mismatch",
+    NonUnicodeEnvironmentValue => "non_unicode_environment_value",
+    EnvironmentReadFailed => "environment_read_failed",
+    PathMissing => "path_missing",
+    PathPresent => "path_present",
+    PathKindMismatch => "path_kind_mismatch",
+    BrokenSymlink => "broken_symlink",
+    PathMetadataFailed => "path_metadata_failed",
+    SymlinkLoop => "symlink_loop",
+    CommandNotFound => "command_not_found",
+    CommandNotExecutable => "command_not_executable",
+    WorkingDirectoryInvalid => "working_directory_invalid",
+    TimedOut => "timed_out",
+    CommandTerminated => "command_terminated",
+    ExitCodeMismatch => "exit_code_mismatch",
+    StdoutConditionMismatch => "stdout_condition_mismatch",
+    StderrConditionMismatch => "stderr_condition_mismatch",
+    CommandContainmentFailed => "command_containment_failed",
+    CommandCleanupFailed => "command_cleanup_failed",
+    CommandOutputReadFailed => "command_output_read_failed",
+    CommandRuntimeFailed => "command_runtime_failed",
+    ObservationLimitExceeded => "observation_limit_exceeded",
+    ProcessNotRunning => "process_not_running",
+    ProcessUnexpectedlyRunning => "process_unexpectedly_running",
+    ProcessEnumerationFailed => "process_enumeration_failed",
+    PortNotOpen => "port_not_open",
+    PortNotClosed => "port_not_closed",
+    PortUnavailable => "port_unavailable",
+    PortBindFailed => "port_bind_failed",
+    PortConnectFailed => "port_connect_failed",
+    PortNameResolutionFailed => "port_name_resolution_failed",
+    ConnectionStateIndeterminate => "connection_state_indeterminate",
+    DnsResolutionFailed => "dns_resolution_failed",
+    HttpConnectionFailed => "http_connection_failed",
+    TlsValidationFailed => "tls_validation_failed",
+    HttpStatusMismatch => "http_status_mismatch",
+    HttpBodyMismatch => "http_body_mismatch",
+    MissingEnvironmentVariable => "missing_environment_variable",
+    HttpClientBuildFailed => "http_client_build_failed",
+    HttpBodyReadFailed => "http_body_read_failed",
+    BodyDecodeFailed => "body_decode_failed",
+    UnsupportedContentEncoding => "unsupported_content_encoding",
+    InvalidExpandedHeaderValue => "invalid_expanded_header_value",
+    ExpandedHeaderTooLarge => "expanded_header_too_large",
+    HttpRuntimeFailed => "http_runtime_failed",
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Selection {
@@ -29,7 +103,7 @@ pub struct ResultRow {
     pub group: Option<String>,
     pub required: bool,
     pub outcome: Outcome,
-    pub reason: Option<&'static str>,
+    pub reason: Option<Reason>,
     pub summary: String,
     pub help: Option<String>,
     pub duration_ms: u128,
@@ -49,7 +123,7 @@ pub struct Run {
 
 pub(crate) struct ExecutionResult {
     pub(crate) outcome: Outcome,
-    pub(crate) reason: Option<&'static str>,
+    pub(crate) reason: Option<Reason>,
     pub(crate) summary: String,
 }
 
@@ -74,7 +148,10 @@ pub enum SelectionError {
     EmptyGroup(String),
 }
 
-pub(crate) use crate::checks::{begin_terminate_active_commands, terminate_active_commands};
+#[cfg(not(unix))]
+pub(crate) use crate::checks::terminate_active_commands;
+#[cfg(unix)]
+pub(crate) use crate::checks::{begin_terminate_active_commands, wait_for_active_commands};
 
 pub async fn run(
     config: &ValidatedConfig,
@@ -223,7 +300,7 @@ async fn run_one(
     if !check.platforms.contains(&platform) {
         return base(
             Outcome::NotApplicable,
-            Some("platform_not_applicable"),
+            Some(Reason::PlatformNotApplicable),
             "Platform does not apply.".to_owned(),
             0,
             vec![],
@@ -243,7 +320,7 @@ async fn run_one(
     if !blocked_by.is_empty() {
         return base(
             Outcome::Blocked,
-            Some("dependency_not_passed"),
+            Some(Reason::DependencyNotPassed),
             "A dependency did not pass.".to_owned(),
             0,
             blocked_by,
@@ -254,7 +331,7 @@ async fn run_one(
     if !missing_permissions.is_empty() {
         return base(
             Outcome::PermissionDenied,
-            Some("permission_missing"),
+            Some(Reason::PermissionMissing),
             "Required permission was not granted.".to_owned(),
             0,
             vec![],

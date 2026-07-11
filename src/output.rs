@@ -35,7 +35,7 @@ fn human(run: &Run, color: bool) -> String {
             outcome_name(row.outcome)
         ));
         if let Some(reason) = row.reason {
-            output.push_str(&format!(" [{reason}]"));
+            output.push_str(&format!(" [{}]", reason.as_str()));
         }
         if !row.missing_permissions.is_empty() {
             output.push_str(&format!(" ({})", row.missing_permissions.join(", ")));
@@ -176,7 +176,7 @@ fn markdown(run: &Run) -> String {
     output.push_str(if run.full { "| Display | Outcome | Check | Reason | Duration |\n| --- | --- | --- | --- | ---: |\n" } else { "| Display | Outcome | Check | Reason | Duration | Selection |\n| --- | --- | --- | --- | ---: | --- |\n" });
     for row in &run.results {
         let (_, display) = display(row);
-        let reason = row.reason.unwrap_or("-");
+        let reason = row.reason.map(|reason| reason.as_str()).unwrap_or("-");
         if run.full {
             output.push_str(&format!(
                 "| {display} | {} | {} | {} | {} ms |\n",

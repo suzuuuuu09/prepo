@@ -1,8 +1,8 @@
 use crate::config::{
-    Check, CheckSpec, EnvCondition, HttpMethod, PathExpected, PathKind, PortExpected,
-    ProcessExpected, ValidatedConfig, is_env_name,
+    Check, CheckSpec, EnvCondition, HeaderInterpolationPart, HttpMethod, PathExpected, PathKind,
+    PortExpected, ProcessExpected, ValidatedConfig, parse_header_interpolation,
 };
-use crate::engine::{ExecutionResult, Outcome};
+use crate::engine::{ExecutionResult, Outcome, Reason};
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::error::Error as _;
@@ -46,31 +46,44 @@ impl Drop for ActiveCommandGroup {
 }
 
 #[cfg(unix)]
-pub(crate) fn begin_terminate_active_commands() {
-    let groups = ACTIVE_COMMAND_GROUPS
-        .get()
-        .and_then(|groups| groups.lock().ok().map(|groups| groups.clone()))
-        .unwrap_or_default();
-    for group in groups {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(group),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
+pub(crate) fn begin_terminate_active_commands() -> Result<BTreeSet<i32>, ()> {
+    let groups = active_command_groups();
+    signal_process_groups(&groups)?;
+    Ok(groups)
 }
 
 #[cfg(unix)]
-pub(crate) async fn terminate_active_commands() -> Result<(), ()> {
-    begin_terminate_active_commands();
-    let groups = ACTIVE_COMMAND_GROUPS
-        .get()
-        .and_then(|groups| groups.lock().ok().map(|groups| groups.clone()))
-        .unwrap_or_default();
+pub(crate) async fn wait_for_active_commands(groups: BTreeSet<i32>) -> Result<(), ()> {
     wait_for_process_groups(groups).await
 }
 
+#[cfg(unix)]
+fn active_command_groups() -> BTreeSet<i32> {
+    ACTIVE_COMMAND_GROUPS
+        .get()
+        .and_then(|groups| groups.lock().ok().map(|groups| groups.clone()))
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn signal_process_groups(groups: &BTreeSet<i32>) -> Result<(), ()> {
+    let mut failed = false;
+    for group in groups {
+        match nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(*group),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(_) => failed = true,
+        }
+    }
+    if failed { Err(()) } else { Ok(()) }
+}
+
 #[cfg(not(unix))]
-pub(crate) fn begin_terminate_active_commands() {}
+pub(crate) fn begin_terminate_active_commands() -> Result<(), ()> {
+    Ok(())
+}
 
 #[cfg(not(unix))]
 pub(crate) async fn terminate_active_commands() -> Result<(), ()> {
@@ -145,18 +158,18 @@ fn pass() -> ExecutionResult {
         summary: "Check passed.".to_owned(),
     }
 }
-fn fail(reason: &'static str) -> ExecutionResult {
+fn fail(reason: Reason) -> ExecutionResult {
     ExecutionResult {
         outcome: Outcome::Failed,
         reason: Some(reason),
-        summary: reason.replace('_', " "),
+        summary: reason.as_str().replace('_', " "),
     }
 }
-fn error(reason: &'static str) -> ExecutionResult {
+fn error(reason: Reason) -> ExecutionResult {
     ExecutionResult {
         outcome: Outcome::Error,
         reason: Some(reason),
-        summary: reason.replace('_', " "),
+        summary: reason.as_str().replace('_', " "),
     }
 }
 
@@ -167,46 +180,46 @@ fn execute_env(variable: &str, condition: EnvCondition, expected: Option<&str>) 
             if value.is_some() {
                 pass()
             } else {
-                fail("environment_variable_missing")
+                fail(Reason::EnvironmentVariableMissing)
             }
         }
         EnvCondition::NotExists => {
             if value.is_none() {
                 pass()
             } else {
-                fail("environment_variable_present")
+                fail(Reason::EnvironmentVariablePresent)
             }
         }
         _ => match value {
-            None => fail("environment_variable_missing"),
+            None => fail(Reason::EnvironmentVariableMissing),
             Some(value) => match value.into_string() {
-                Err(_) => error("non_unicode_environment_value"),
+                Err(_) => error(Reason::NonUnicodeEnvironmentValue),
                 Ok(value) => match condition {
                     EnvCondition::Equals => {
                         if Some(value.as_str()) == expected {
                             pass()
                         } else {
-                            fail("environment_value_mismatch")
+                            fail(Reason::EnvironmentValueMismatch)
                         }
                     }
                     EnvCondition::NotEquals => {
                         if Some(value.as_str()) != expected {
                             pass()
                         } else {
-                            fail("environment_value_forbidden")
+                            fail(Reason::EnvironmentValueForbidden)
                         }
                     }
                     EnvCondition::Contains => {
                         if value.contains(expected.unwrap_or_default()) {
                             pass()
                         } else {
-                            fail("environment_substring_missing")
+                            fail(Reason::EnvironmentSubstringMissing)
                         }
                     }
                     EnvCondition::Matches => match Regex::new(expected.unwrap_or_default()) {
                         Ok(regex) if regex.is_match(&value) => pass(),
-                        Ok(_) => fail("environment_pattern_mismatch"),
-                        Err(_) => error("environment_read_failed"),
+                        Ok(_) => fail(Reason::EnvironmentPatternMismatch),
+                        Err(_) => error(Reason::EnvironmentReadFailed),
                     },
                     _ => unreachable!(),
                 },
@@ -227,21 +240,23 @@ fn execute_path(
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(path);
     match std::fs::symlink_metadata(&target) {
-        Ok(_metadata) if matches!(expected, PathExpected::Missing) => fail("path_present"),
+        Ok(_metadata) if matches!(expected, PathExpected::Missing) => fail(Reason::PathPresent),
         Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::metadata(&target) {
             Ok(metadata) => compare_path_kind(metadata, kind),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fail("broken_symlink"),
-            Err(_) => error("path_metadata_failed"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fail(Reason::BrokenSymlink)
+            }
+            Err(_) => error(Reason::PathMetadataFailed),
         },
         Ok(metadata) => compare_path_kind(metadata, kind),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if matches!(expected, PathExpected::Missing) {
                 pass()
             } else {
-                fail("path_missing")
+                fail(Reason::PathMissing)
             }
         }
-        Err(_) => error("path_metadata_failed"),
+        Err(_) => error(Reason::PathMetadataFailed),
     }
 }
 
@@ -254,7 +269,7 @@ fn compare_path_kind(metadata: std::fs::Metadata, kind: Option<PathKind>) -> Exe
     if matches {
         pass()
     } else {
-        fail("path_kind_mismatch")
+        fail(Reason::PathKindMismatch)
     }
 }
 
@@ -267,8 +282,8 @@ fn execute_process(process: &str, expected: ProcessExpected) -> ExecutionResult 
         .any(|candidate| candidate.name() == OsStr::new(process));
     match (expected, found) {
         (ProcessExpected::Running, true) | (ProcessExpected::Stopped, false) => pass(),
-        (ProcessExpected::Running, false) => fail("process_not_running"),
-        (ProcessExpected::Stopped, true) => fail("process_unexpectedly_running"),
+        (ProcessExpected::Running, false) => fail(Reason::ProcessNotRunning),
+        (ProcessExpected::Stopped, true) => fail(Reason::ProcessUnexpectedlyRunning),
     }
 }
 
@@ -284,8 +299,10 @@ async fn execute_port(
                 drop(listener);
                 pass()
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => fail("port_unavailable"),
-            Err(_) => error("port_bind_failed"),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                fail(Reason::PortUnavailable)
+            }
+            Err(_) => error(Reason::PortBindFailed),
         };
     }
     let address = if host.contains(':') {
@@ -297,9 +314,9 @@ async fn execute_port(
         Ok(addresses) => addresses.collect::<Vec<_>>(),
         Err(_) => {
             return if matches!(expected, PortExpected::Open) {
-                error("port_name_resolution_failed")
+                error(Reason::PortNameResolutionFailed)
             } else {
-                error("connection_state_indeterminate")
+                error(Reason::ConnectionStateIndeterminate)
             };
         }
     };
@@ -316,30 +333,30 @@ async fn execute_port(
     match tokio::time::timeout(Duration::from_secs(timeout_seconds.unwrap_or(1)), attempt).await {
         Err(_) => {
             if matches!(expected, PortExpected::Open) {
-                fail("timed_out")
+                fail(Reason::TimedOut)
             } else {
-                error("connection_state_indeterminate")
+                error(Reason::ConnectionStateIndeterminate)
             }
         }
         Ok(Ok(_)) => {
             if matches!(expected, PortExpected::Open) {
                 pass()
             } else {
-                fail("port_not_closed")
+                fail(Reason::PortNotClosed)
             }
         }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
             if matches!(expected, PortExpected::Closed) {
                 pass()
             } else {
-                fail("port_not_open")
+                fail(Reason::PortNotOpen)
             }
         }
         Ok(Err(_)) => {
             if matches!(expected, PortExpected::Open) {
-                error("port_connect_failed")
+                error(Reason::PortConnectFailed)
             } else {
-                error("connection_state_indeterminate")
+                error(Reason::ConnectionStateIndeterminate)
             }
         }
     }
@@ -377,12 +394,12 @@ async fn execute_command(
     let mut child = match child.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return fail("command_not_found");
+            return fail(Reason::CommandNotFound);
         }
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            return fail("command_not_executable");
+            return fail(Reason::CommandNotExecutable);
         }
-        Err(_) => return fail("working_directory_invalid"),
+        Err(_) => return fail(Reason::WorkingDirectoryInvalid),
     };
     let containment = match establish_command_containment(&child) {
         Ok(containment) => containment,
@@ -413,26 +430,26 @@ async fn execute_command(
     .await;
     match event {
         Err(_) => match terminate_command_tree(process_id, &containment).await {
-            Ok(()) => fail("timed_out"),
-            Err(()) => error("command_cleanup_failed"),
+            Ok(()) => fail(Reason::TimedOut),
+            Err(()) => error(Reason::CommandCleanupFailed),
         },
         Ok(CommandEvent::Observed(Err(ObserveError::LimitExceeded))) => {
             match terminate_command_tree(process_id, &containment).await {
-                Ok(()) => error("observation_limit_exceeded"),
-                Err(()) => error("command_cleanup_failed"),
+                Ok(()) => error(Reason::ObservationLimitExceeded),
+                Err(()) => error(Reason::CommandCleanupFailed),
             }
         }
         Ok(CommandEvent::Observed(Err(ObserveError::ReadFailed | ObserveError::DecodeFailed))) => {
             match terminate_command_tree(process_id, &containment).await {
-                Ok(()) => error("command_output_read_failed"),
-                Err(()) => error("command_cleanup_failed"),
+                Ok(()) => error(Reason::CommandOutputReadFailed),
+                Err(()) => error(Reason::CommandCleanupFailed),
             }
         }
-        Ok(CommandEvent::Exited(Err(_))) => error("command_runtime_failed"),
+        Ok(CommandEvent::Exited(Err(_))) => error(Reason::CommandRuntimeFailed),
         Ok(CommandEvent::Exited(Ok(status))) => match observations.await {
-            Err(ObserveError::LimitExceeded) => error("observation_limit_exceeded"),
+            Err(ObserveError::LimitExceeded) => error(Reason::ObservationLimitExceeded),
             Err(ObserveError::ReadFailed | ObserveError::DecodeFailed) => {
-                error("command_output_read_failed")
+                error(Reason::CommandOutputReadFailed)
             }
             Ok((stdout, stderr)) => evaluate_command(
                 status,
@@ -444,7 +461,7 @@ async fn execute_command(
             ),
         },
         Ok(CommandEvent::Observed(Ok((stdout, stderr)))) => match wait.await {
-            Err(_) => error("command_runtime_failed"),
+            Err(_) => error(Reason::CommandRuntimeFailed),
             Ok(status) => evaluate_command(
                 status,
                 expected_exit_code,
@@ -466,16 +483,16 @@ fn evaluate_command(
     stderr: Observation,
 ) -> ExecutionResult {
     if !status.success() && status.code().is_none() {
-        return fail("command_terminated");
+        return fail(Reason::CommandTerminated);
     }
     if status.code() != Some(expected_exit_code) {
-        return fail("exit_code_mismatch");
+        return fail(Reason::ExitCodeMismatch);
     }
     if stdout_contains.is_some() && !stdout.matched {
-        return fail("stdout_condition_mismatch");
+        return fail(Reason::StdoutConditionMismatch);
     }
     if stderr_not_contains.is_some() && stderr.matched {
-        return fail("stderr_condition_mismatch");
+        return fail(Reason::StderrConditionMismatch);
     }
     pass()
 }
@@ -572,9 +589,7 @@ where
 }
 
 #[cfg(unix)]
-fn configure_command_containment(
-    command: &mut tokio::process::Command,
-) -> Result<(), &'static str> {
+fn configure_command_containment(command: &mut tokio::process::Command) -> Result<(), Reason> {
     use std::os::unix::process::CommandExt;
     command.as_std_mut().process_group(0);
     Ok(())
@@ -583,14 +598,12 @@ fn configure_command_containment(
 #[cfg(unix)]
 fn establish_command_containment(
     _child: &tokio::process::Child,
-) -> Result<CommandContainment, &'static str> {
+) -> Result<CommandContainment, Reason> {
     Ok(CommandContainment {})
 }
 
 #[cfg(windows)]
-fn configure_command_containment(
-    _command: &mut tokio::process::Command,
-) -> Result<(), &'static str> {
+fn configure_command_containment(_command: &mut tokio::process::Command) -> Result<(), Reason> {
     // Windows containment is installed after spawning by the Job Object path.
     Ok(())
 }
@@ -598,18 +611,18 @@ fn configure_command_containment(
 #[cfg(windows)]
 fn establish_command_containment(
     child: &tokio::process::Child,
-) -> Result<CommandContainment, &'static str> {
+) -> Result<CommandContainment, Reason> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject,
     };
-    let raw = child.raw_handle().ok_or("command_containment_failed")? as HANDLE;
+    let raw = child.raw_handle().ok_or(Reason::CommandContainmentFailed)? as HANDLE;
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
-            return Err("command_containment_failed");
+            return Err(Reason::CommandContainmentFailed);
         }
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -622,24 +635,22 @@ fn establish_command_containment(
         let assigned = configured && AssignProcessToJobObject(job, raw) != 0;
         if !assigned {
             CloseHandle(job);
-            return Err("command_containment_failed");
+            return Err(Reason::CommandContainmentFailed);
         }
         Ok(CommandContainment { job, process: raw })
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_command_containment(
-    _command: &mut tokio::process::Command,
-) -> Result<(), &'static str> {
-    Err("command_containment_failed")
+fn configure_command_containment(_command: &mut tokio::process::Command) -> Result<(), Reason> {
+    Err(Reason::CommandContainmentFailed)
 }
 
 #[cfg(not(any(unix, windows)))]
 fn establish_command_containment(
     _child: &tokio::process::Child,
-) -> Result<CommandContainment, &'static str> {
-    Err("command_containment_failed")
+) -> Result<CommandContainment, Reason> {
+    Err(Reason::CommandContainmentFailed)
 }
 
 #[cfg(unix)]
@@ -653,15 +664,7 @@ async fn terminate_command_tree(
 
 #[cfg(unix)]
 async fn terminate_process_groups(groups: BTreeSet<i32>) -> Result<(), ()> {
-    for group in &groups {
-        match nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(*group),
-            nix::sys::signal::Signal::SIGKILL,
-        ) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(_) => return Err(()),
-        }
-    }
+    signal_process_groups(&groups)?;
     wait_for_process_groups(groups).await
 }
 
@@ -731,13 +734,13 @@ async fn execute_http(
     let started = Instant::now();
     let parsed_url = match reqwest::Url::parse(url) {
         Ok(url) => url,
-        Err(_) => return error("http_runtime_failed"),
+        Err(_) => return error(Reason::HttpRuntimeFailed),
     };
     let Some(host) = parsed_url.host_str() else {
-        return error("http_runtime_failed");
+        return error(Reason::HttpRuntimeFailed);
     };
     let Some(port) = parsed_url.port_or_known_default() else {
-        return error("http_runtime_failed");
+        return error(Reason::HttpRuntimeFailed);
     };
     let addresses = match tokio::time::timeout(
         Duration::from_secs(timeout_seconds),
@@ -745,13 +748,13 @@ async fn execute_http(
     )
     .await
     {
-        Err(_) => return fail("timed_out"),
-        Ok(Err(_)) => return fail("dns_resolution_failed"),
+        Err(_) => return fail(Reason::TimedOut),
+        Ok(Err(_)) => return fail(Reason::DnsResolutionFailed),
         Ok(Ok(addresses)) => addresses.collect::<Vec<_>>(),
     };
     let remaining = Duration::from_secs(timeout_seconds).saturating_sub(started.elapsed());
     if remaining.is_zero() {
-        return fail("timed_out");
+        return fail(Reason::TimedOut);
     }
     let builder = reqwest::Client::builder()
         .no_proxy()
@@ -760,7 +763,7 @@ async fn execute_http(
         .resolve_to_addrs(host, &addresses);
     let client = match builder.build() {
         Ok(client) => client,
-        Err(_) => return error("http_client_build_failed"),
+        Err(_) => return error(Reason::HttpClientBuildFailed),
     };
     let mut request = match method {
         HttpMethod::Get => client.get(url),
@@ -774,27 +777,27 @@ async fn execute_http(
         };
         expanded_bytes += expanded.len();
         if expanded_bytes > 64 * 1024 {
-            return error("expanded_header_too_large");
+            return error(Reason::ExpandedHeaderTooLarge);
         }
         request = request.header(name, expanded);
     }
     let response = match request.send().await {
         Ok(response) => response,
-        Err(error) if error.is_timeout() => return fail("timed_out"),
-        Err(error) if is_tls_error(&error) => return fail("tls_validation_failed"),
-        Err(error) if error.is_connect() => return fail("http_connection_failed"),
-        Err(_) => return error("http_runtime_failed"),
+        Err(error) if error.is_timeout() => return fail(Reason::TimedOut),
+        Err(error) if is_tls_error(&error) => return fail(Reason::TlsValidationFailed),
+        Err(error) if error.is_connect() => return fail(Reason::HttpConnectionFailed),
+        Err(_) => return error(Reason::HttpRuntimeFailed),
     };
     if response.status().as_u16() != expected_status {
-        return fail("http_status_mismatch");
+        return fail(Reason::HttpStatusMismatch);
     }
     if let Some(value) = response.headers().get(reqwest::header::CONTENT_ENCODING) {
         let value = match value.to_str() {
             Ok(value) => value,
-            Err(_) => return error("unsupported_content_encoding"),
+            Err(_) => return error(Reason::UnsupportedContentEncoding),
         };
         if !matches!(value, "identity" | "gzip") {
-            return error("unsupported_content_encoding");
+            return error(Reason::UnsupportedContentEncoding);
         }
     }
     let Some(pattern) = body_contains else {
@@ -802,10 +805,10 @@ async fn execute_http(
     };
     match observe_http_body(response, pattern).await {
         Ok(true) => pass(),
-        Ok(false) => fail("http_body_mismatch"),
-        Err(ObserveError::LimitExceeded) => error("observation_limit_exceeded"),
-        Err(ObserveError::ReadFailed) => error("http_body_read_failed"),
-        Err(ObserveError::DecodeFailed) => error("body_decode_failed"),
+        Ok(false) => fail(Reason::HttpBodyMismatch),
+        Err(ObserveError::LimitExceeded) => error(Reason::ObservationLimitExceeded),
+        Err(ObserveError::ReadFailed) => error(Reason::HttpBodyReadFailed),
+        Err(ObserveError::DecodeFailed) => error(Reason::BodyDecodeFailed),
     }
 }
 
@@ -839,29 +842,24 @@ async fn observe_http_body(
 
 fn expand_header(value: &str) -> Result<String, ExecutionResult> {
     let mut output = String::new();
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        output.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
-            return Err(error("invalid_expanded_header_value"));
-        };
-        let name = &after[..end];
-        if !is_env_name(name) {
-            return Err(error("invalid_expanded_header_value"));
+    let parts = parse_header_interpolation(value)
+        .map_err(|()| error(Reason::InvalidExpandedHeaderValue))?;
+    for part in parts {
+        match part {
+            HeaderInterpolationPart::Literal(value) => output.push_str(value),
+            HeaderInterpolationPart::Variable(name) => {
+                let variable = std::env::var_os(name)
+                    .ok_or_else(|| fail(Reason::MissingEnvironmentVariable))?
+                    .into_string()
+                    .map_err(|_| error(Reason::NonUnicodeEnvironmentValue))?;
+                output.push_str(&variable);
+            }
         }
-        let variable = std::env::var_os(name)
-            .ok_or_else(|| fail("missing_environment_variable"))?
-            .into_string()
-            .map_err(|_| error("non_unicode_environment_value"))?;
-        output.push_str(&variable);
-        rest = &after[end + 1..];
     }
-    output.push_str(rest);
     if output.len() > 8192 {
-        Err(error("expanded_header_too_large"))
+        Err(error(Reason::ExpandedHeaderTooLarge))
     } else if output.chars().any(|character| character.is_control()) {
-        Err(error("invalid_expanded_header_value"))
+        Err(error(Reason::InvalidExpandedHeaderValue))
     } else {
         Ok(output)
     }

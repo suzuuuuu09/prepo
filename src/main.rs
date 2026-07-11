@@ -241,13 +241,16 @@ async fn run_until_interrupted(
 
 #[cfg(unix)]
 async fn wait_for_cleanup_or_second_signal(sigterm: &mut tokio::signal::unix::Signal) -> bool {
-    engine::begin_terminate_active_commands();
-    let cleanup = engine::terminate_active_commands();
+    let groups = match engine::begin_terminate_active_commands() {
+        Ok(groups) => groups,
+        Err(()) => return true,
+    };
+    let cleanup = engine::wait_for_active_commands(groups);
     tokio::pin!(cleanup);
     tokio::select! {
         result = &mut cleanup => result.is_err(),
-        _ = tokio::signal::ctrl_c() => false,
-        _ = sigterm.recv() => false,
+        _ = tokio::signal::ctrl_c() => engine::begin_terminate_active_commands().is_err(),
+        _ = sigterm.recv() => engine::begin_terminate_active_commands().is_err(),
     }
 }
 

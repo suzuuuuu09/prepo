@@ -286,13 +286,24 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
         errors.push("checks may contain at most 1024 entries".to_owned());
     }
 
-    let mut ids = HashMap::new();
+    let ids = raw
+        .checks
+        .iter()
+        .enumerate()
+        .map(|(index, check)| (check.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut seen_ids = BTreeSet::new();
+    let mut checks = Vec::with_capacity(raw.checks.len());
     for (index, check) in raw.checks.iter().enumerate() {
         if !is_kebab_case(&check.id) || check.id.len() > 64 {
             errors.push(format!("check {} has an invalid id", index + 1));
         }
-        if ids.insert(check.id.as_str(), index).is_some() {
+        if !seen_ids.insert(check.id.as_str()) {
             errors.push(format!("duplicate check id: {}", check.id));
+        }
+        let type_is_valid = is_check_type(&check.kind);
+        if !type_is_valid {
+            errors.push(format!("check {}: type is invalid", check.id));
         }
         validate_text("checks.name", &check.name, 256, &mut errors);
         if let Some(group) = &check.group {
@@ -314,11 +325,11 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
         {
             errors.push(format!("check {} has invalid dependencies", check.id));
         }
-    }
-    let mut checks = Vec::with_capacity(raw.checks.len());
-    for check in &raw.checks {
-        match validate_check(check, raw.runner.default_timeout_seconds) {
-            Ok(spec) => checks.push(Some(Check {
+        let spec = type_is_valid
+            .then(|| validate_check(check, raw.runner.default_timeout_seconds))
+            .transpose();
+        match spec {
+            Ok(Some(spec)) => checks.push(Some(Check {
                 id: check.id.clone(),
                 name: check.name.clone(),
                 required: check.required,
@@ -328,6 +339,7 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
                 help: check.help.clone(),
                 spec,
             })),
+            Ok(None) => checks.push(None),
             Err(error) => {
                 errors.push(format!("check {}: {error}", check.id));
                 checks.push(None);
@@ -373,6 +385,13 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
         },
         checks,
     })
+}
+
+fn is_check_type(value: &str) -> bool {
+    matches!(
+        value,
+        "env" | "path" | "command" | "process" | "port" | "http"
+    )
 }
 
 fn validate_graph(checks: &[Option<Check>], errors: &mut Vec<String>) {
@@ -665,7 +684,7 @@ fn validate_check(check: &RawCheck, default_timeout_seconds: u64) -> Result<Chec
                 timeout_seconds: timeout(check.timeout_seconds)?,
             })
         }
-        _ => Err("type is invalid".to_owned()),
+        _ => unreachable!("check type was validated before check fields"),
     }
 }
 
@@ -840,7 +859,7 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), String> {
             || !is_http_header_name(name)
             || value.len() > 8192
             || has_unsafe_text(value)
-            || !has_valid_header_interpolation(value)
+            || parse_header_interpolation(value).is_err()
             || forbidden.contains(&lower.as_str())
             || !names.insert(lower)
         {
@@ -873,17 +892,28 @@ fn is_http_header_name(value: &str) -> bool {
     })
 }
 
-fn has_valid_header_interpolation(value: &str) -> bool {
+pub(crate) enum HeaderInterpolationPart<'a> {
+    Literal(&'a str),
+    Variable(&'a str),
+}
+
+pub(crate) fn parse_header_interpolation(
+    value: &str,
+) -> Result<Vec<HeaderInterpolationPart<'_>>, ()> {
+    let mut parts = Vec::new();
     let mut rest = value;
     while let Some(start) = rest.find("${") {
+        parts.push(HeaderInterpolationPart::Literal(&rest[..start]));
         let after = &rest[start + 2..];
         let Some(end) = after.find('}') else {
-            return false;
+            return Err(());
         };
         if !is_env_name(&after[..end]) {
-            return false;
+            return Err(());
         }
+        parts.push(HeaderInterpolationPart::Variable(&after[..end]));
         rest = &after[end + 1..];
     }
-    true
+    parts.push(HeaderInterpolationPart::Literal(rest));
+    Ok(parts)
 }

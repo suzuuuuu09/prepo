@@ -210,6 +210,78 @@ Authorization = "Bearer ${NOT-COMPLETE}"
 }
 
 #[test]
+fn validate_reports_semantic_errors_in_check_declaration_order() {
+    let directory = tempdir().expect("temporary directory");
+    fs::write(
+        directory.path().join("prepo.toml"),
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "first"
+type = "not-a-check"
+name = "First"
+[[checks]]
+id = "second"
+type = "path"
+name = "Second"
+platforms = []
+path = "."
+expected = "exists"
+kind = "directory"
+"#,
+    )
+    .expect("configuration");
+
+    let output = Command::cargo_bin("prepo")
+        .expect("prepo binary")
+        .current_dir(directory.path())
+        .arg("validate")
+        .output()
+        .expect("prepo output");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let first = stderr.find("check first: type is invalid").unwrap();
+    let second = stderr.find("check second has invalid platforms").unwrap();
+    assert!(first < second);
+}
+
+#[test]
+fn validate_reports_platform_errors_before_type_specific_fields() {
+    let directory = tempdir().expect("temporary directory");
+    fs::write(
+        directory.path().join("prepo.toml"),
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "health"
+type = "http"
+name = "Health"
+platforms = []
+url = "https://example.test/"
+[checks.headers]
+Authorization = "Bearer ${NOT-COMPLETE}"
+"#,
+    )
+    .expect("configuration");
+
+    let output = Command::cargo_bin("prepo")
+        .expect("prepo binary")
+        .current_dir(directory.path())
+        .arg("validate")
+        .output()
+        .expect("prepo output");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let platforms = stderr.find("invalid platforms").unwrap();
+    let headers = stderr.find("headers are invalid").unwrap();
+    assert!(platforms < headers);
+}
+
+#[test]
 fn validate_collects_graph_errors_even_when_another_check_is_invalid() {
     let directory = tempdir().expect("temporary directory");
     fs::write(
