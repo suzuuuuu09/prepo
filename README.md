@@ -68,12 +68,12 @@ version = 1
 name = "example"
 
 [[checks]]
-id = "git-directory"
+id = "git-repository"
 type = "path"
 name = "Git repository"
 path = ".git"
 expected = "exists"
-kind = "directory"
+kind = "any"
 ```
 
 ## Example configuration

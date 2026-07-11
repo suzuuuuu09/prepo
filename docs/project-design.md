@@ -21,11 +21,11 @@ Ready は「現在の環境で適用対象となる必須チェックがすべ�
 | 設定ファイル | prepo.toml |
 | 実装言語 | Rust 2024 Edition |
 | MSRV | Rust 1.85 |
-| ライセンス | MIT OR Apache-2.0 |
+| ライセンス | Apache-2.0 |
 
 英語の短い説明文は “Preflight checks for development repositories.” とする。より詳しい説明文は “A declarative CLI for checking whether a development repository is ready to run in the current environment.” とする。
 
-Cargo manifest のライセンス表記は MIT OR Apache-2.0 とし、LICENSE-MIT、LICENSE-APACHE、README、コントリビューション方針で同じデュアルライセンスを示す。
+Cargo manifest のライセンス表記は Apache-2.0 とし、LICENSE、README、コントリビューション方針で同じ Apache-2.0 ライセンスを示す。
 
 ## 3. 目的と非目的
 
