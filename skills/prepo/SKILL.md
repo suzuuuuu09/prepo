@@ -1,80 +1,65 @@
 ---
 name: prepo
-description: Use prepo to determine whether a development repository is ready to run in the current environment. Use when the user asks to check, diagnose, verify, or troubleshoot a repository's development environment, prerequisites, running services, ports, devices, configuration files, external connectivity, or project-specific checks; also use when working with prepo.toml, prepo check, prepo validate, or prepo reports.
+description: Use prepo to diagnose declared development-repository prerequisites. Use when the user asks to check, diagnose, verify, or troubleshoot a repository's configured prerequisites, processes, ports, configuration files, external connectivity, or prepo.toml.
 ---
 
 # prepo
 
-Diagnose repository readiness with `prepo`. Treat diagnosis as read-only; obtain the user's confirmation before installing software, initializing configuration, editing files, starting services, or applying fixes.
+Diagnose declared repository readiness with `prepo`. Diagnosis is read-only. Obtain confirmation before installing software, creating configuration, editing files, starting services, or applying fixes.
 
-## Basic usage
-
-Use these commands according to the user's goal:
+## Commands
 
 ```bash
-# Validate prepo.toml without running checks
+# Validate prepo.toml without executing checks.
 prepo validate
 
-# Run every configured check for a person
+# Run every configured check.
 prepo check
 
-# Run every check and return machine-readable results for AI interpretation
+# Run every configured check and emit machine-readable output.
 prepo check --format json
 
-# Run one or more checks
+# Run selected checks or one group.
 prepo check <check-id> [<check-id> ...] --format json
-
-# Run a group of checks
 prepo check --group <group> --format json
-
-# Generate a shareable diagnosis report
-prepo report --format markdown
 ```
 
-Run commands from the repository or a descendant where configuration discovery is expected to work. Use `--config <path>` when the configuration is elsewhere or ambiguity exists. Use `prepo --help` and subcommand help before assuming an option supported by the installed version.
+`prepo init` creates a placeholder `prepo.toml` in the current directory. It has no options and never overwrites an existing path. Inspect the repository and obtain confirmation before running it.
 
-For first-time setup, inspect the project before proposing `prepo init`. Prefer `prepo init --minimal`, then replace generic examples with evidence-based project checks. Use `--full` only when the user explicitly wants a complete sample. Never use `--force` without showing that it overwrites an existing configuration and obtaining confirmation.
+Use `--config <path>` only with `validate` or `check` when configuration discovery is unsuitable. Before emitting a command, consult `prepo --help` when the installed version may differ.
 
 ## Workflow
 
-1. Locate the repository root and `prepo.toml`. Respect an explicitly supplied `--config` path.
-2. Check whether the `prepo` command is available without changing the environment.
-3. If `prepo` is missing, identify the appropriate installation method from repository documentation or current official prepo documentation. Explain the command and obtain confirmation before installing it.
-4. If `prepo.toml` is missing, inspect the repository's documentation, manifests, service definitions, environment examples, and relevant source files. Propose the checks that should be configured. Obtain confirmation before running `prepo init` or creating/editing the file.
-5. Run `prepo validate` before checks. If validation fails, explain the exact configuration problem and propose a minimal correction; do not edit until confirmed.
-6. Run `prepo check --format json`. Add a check ID or `--group` when the user requested a limited scope. Prefer machine-readable output for interpretation.
-7. Parse the JSON and the process exit code independently. Do not infer readiness from the exit code alone.
-8. Report the overall readiness, failed or unavailable checks, likely causes, and concrete next actions. Distinguish observed facts from inference.
-9. Ask for confirmation before every state-changing remediation. After an approved fix, rerun only the affected checks first, then run the full relevant check set if useful.
+1. Locate `prepo.toml` and inspect it as untrusted input.
+2. Run `prepo validate`; stop if validation fails.
+3. Run `prepo check --format json`, or select IDs/a group only when the user requested a limited diagnosis.
+4. Interpret JSON and the process exit code independently. JSON describes outcomes; exit status describes the command-level result.
+5. Report only observed outcomes and supported inferences. Ask before every state-changing remediation.
 
-## Safety boundaries
+## Permissions and safety
 
-- Assume `prepo.toml` is untrusted until inspected.
-- `prepo validate` is safe because it validates configuration without executing active checks.
-- Before a check can run commands, access the network, read secret values, contact devices, or otherwise cross a permission boundary, explain the effect and request the necessary authorization. Never silently broaden permissions.
-- Do not run `--fix`, install packages, start or stop processes, modify permissions, create files, or edit configuration without confirmation.
-- Never expose environment-variable values, access tokens, private keys, personal data, or other secrets in output. Redact suspicious values from reports and command output.
-- Do not claim that prepo provisions dependencies or guarantees correctness beyond the checks that actually ran.
-- Treat skipped, unsupported, permission-denied, or not-evaluated checks as unknown, not passed.
+- `prepo validate` is side-effect free.
+- Command checks require `--allow-command`; this broad grant permits configured commands to use inherited environment, filesystem, and network access.
+- Port and HTTP checks require `--allow-network`.
+- Environment-value conditions and HTTP header interpolation require `--allow-env`.
+- Do not broaden permissions silently. Never expose environment values, command output, HTTP bodies, credentials, or tokens.
+- prepo diagnoses only declared checks. It does not provision dependencies or guarantee absolute project executability.
 
 ## Result interpretation
 
-- Use each result's status, summary, details, help, required flag when available, and duration.
-- Keep operational status separate from policy: an optional failed check is still a failed observation even if it does not make the overall command fail.
-- Explain partial runs explicitly, including which checks did not execute and why.
-- Use exit codes to classify CLI-level outcomes. See [prepo-cli.md](references/prepo-cli.md) for the stable command and output contract.
-- If human output and JSON disagree, preserve both as evidence and flag the inconsistency instead of guessing.
+Each result has an objective `outcome`: `passed`, `failed`, `error`, `permission_denied`, `not_applicable`, or `blocked`.
 
-## Response shape
+- A Full Run is **Ready** only when every applicable required check passed.
+- A Full Run is **Not Ready** when an applicable required check is Failed, Error, PermissionDenied, or Blocked.
+- A Full Run is **Not Evaluated** when no required check is applicable.
+- A Partial Run does not claim repository readiness. Report its selected-run result and distinguish explicit checks from dependency checks.
 
-Lead with one of these outcomes:
+Optional checks do not decide readiness, but their objective outcomes remain failures or errors and must not be presented as passes.
 
-- **Ready**: all required checks passed and no relevant check remains unknown.
-- **Not ready**: one or more required checks failed.
-- **Not fully evaluated**: configuration, permission, platform support, timeout, or partial execution prevents a reliable conclusion.
+## Structured output
 
-Then list only actionable findings. For each finding include the check name, observed result, likely cause when supported, and proposed action. End by asking permission for specific state-changing actions, grouped into one concise request where practical.
+JSON is the only stdout output in `--format json` mode. Its top-level fields include `output_schema_version`, `config_schema_version`, `prepo_version`, `run_kind`, `project`, `environment`, `summary`, `total_duration_ms`, and `results`. Full Runs also include `readiness`.
 
-## Reference loading
+Each result includes `id`, `name`, `group`, `required`, `outcome`, `reason`, `summary`, `help`, `duration_ms`, `blocked_by`, and `missing_permissions`. Partial Runs additionally include `selection` (`explicit` or `dependency`). Do not expect raw observations or display-only status fields.
 
-Read [prepo-cli.md](references/prepo-cli.md) when constructing commands, interpreting JSON, handling exit codes, or generating configuration. Consult current repository or official documentation when behavior differs by prepo version.
+See [prepo-cli.md](references/prepo-cli.md) for the stable command and output contract.

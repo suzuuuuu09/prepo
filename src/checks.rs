@@ -31,6 +31,17 @@ impl ActiveCommandGroup {
         }
         Self(process_id)
     }
+
+    fn disarm(&mut self) {
+        let Some(process_id) = self.0.take() else {
+            return;
+        };
+        if let Some(groups) = ACTIVE_COMMAND_GROUPS.get() {
+            if let Ok(mut groups) = groups.lock() {
+                groups.remove(&process_id);
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -38,11 +49,7 @@ impl Drop for ActiveCommandGroup {
     fn drop(&mut self) {
         if let Some(process_id) = self.0 {
             let _ = signal_process_groups(&[process_id].into_iter().collect());
-            if let Some(groups) = ACTIVE_COMMAND_GROUPS.get() {
-                if let Ok(mut groups) = groups.lock() {
-                    groups.remove(&process_id);
-                }
-            }
+            self.disarm();
         }
     }
 }
@@ -417,9 +424,11 @@ async fn execute_command(
         Ok(containment) => containment,
         Err(reason) => return error(reason),
     };
+    #[cfg(windows)]
+    let mut containment = containment;
     let process_id = child.id();
     #[cfg(unix)]
-    let _active_group = ActiveCommandGroup::register(process_id);
+    let mut active_group = ActiveCommandGroup::register(process_id);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut wait = Box::pin(child.wait());
@@ -433,14 +442,17 @@ async fn execute_command(
         Exited(Result<std::process::ExitStatus, std::io::Error>),
         Observed(Result<(Observation, Observation), ObserveError>),
     }
-    let event = tokio::time::timeout(Duration::from_secs(timeout_seconds), async {
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let event = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
         tokio::select! {
             status = &mut wait => CommandEvent::Exited(status),
             observation = &mut observations => CommandEvent::Observed(observation),
         }
     })
     .await;
-    match event {
+    #[cfg(windows)]
+    let mut completed_normally = false;
+    let result = match event {
         Err(_) => match terminate_command_tree(process_id, &containment, wait).await {
             Ok(()) => fail(Reason::TimedOut),
             Err(()) => error(Reason::CommandCleanupFailed),
@@ -457,33 +469,90 @@ async fn execute_command(
                 Err(()) => error(Reason::CommandCleanupFailed),
             }
         }
-        Ok(CommandEvent::Exited(Err(_))) => error(Reason::CommandRuntimeFailed),
-        Ok(CommandEvent::Exited(Ok(status))) => match observations.await {
-            Err(ObserveError::LimitExceeded) => error(Reason::ObservationLimitExceeded),
-            Err(ObserveError::ReadFailed | ObserveError::DecodeFailed) => {
-                error(Reason::CommandOutputReadFailed)
+        Ok(CommandEvent::Exited(Err(_))) => {
+            match terminate_exited_command_descendants(process_id, &containment).await {
+                Ok(()) => error(Reason::CommandRuntimeFailed),
+                Err(()) => error(Reason::CommandCleanupFailed),
             }
-            Ok((stdout, stderr)) => evaluate_command(
-                status,
-                expected_exit_code,
-                stdout_contains,
-                stderr_not_contains,
-                stdout,
-                stderr,
-            ),
-        },
-        Ok(CommandEvent::Observed(Ok((stdout, stderr)))) => match wait.await {
-            Err(_) => error(Reason::CommandRuntimeFailed),
-            Ok(status) => evaluate_command(
-                status,
-                expected_exit_code,
-                stdout_contains,
-                stderr_not_contains,
-                stdout,
-                stderr,
-            ),
-        },
+        }
+        Ok(CommandEvent::Exited(Ok(status))) => {
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                &mut observations,
+            )
+            .await
+            {
+                Err(_) => {
+                    match terminate_exited_command_descendants(process_id, &containment).await {
+                        Ok(()) => fail(Reason::TimedOut),
+                        Err(()) => error(Reason::CommandCleanupFailed),
+                    }
+                }
+                Ok(Err(ObserveError::LimitExceeded)) => {
+                    match terminate_exited_command_descendants(process_id, &containment).await {
+                        Ok(()) => error(Reason::ObservationLimitExceeded),
+                        Err(()) => error(Reason::CommandCleanupFailed),
+                    }
+                }
+                Ok(Err(ObserveError::ReadFailed | ObserveError::DecodeFailed)) => {
+                    match terminate_exited_command_descendants(process_id, &containment).await {
+                        Ok(()) => error(Reason::CommandOutputReadFailed),
+                        Err(()) => error(Reason::CommandCleanupFailed),
+                    }
+                }
+                Ok(Ok((stdout, stderr))) => {
+                    #[cfg(windows)]
+                    {
+                        completed_normally = true;
+                    }
+                    evaluate_command(
+                        status,
+                        expected_exit_code,
+                        stdout_contains,
+                        stderr_not_contains,
+                        stdout,
+                        stderr,
+                    )
+                }
+            }
+        }
+        Ok(CommandEvent::Observed(Ok((stdout, stderr)))) => {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut wait).await
+            {
+                Err(_) => match terminate_command_tree(process_id, &containment, wait).await {
+                    Ok(()) => fail(Reason::TimedOut),
+                    Err(()) => error(Reason::CommandCleanupFailed),
+                },
+                Ok(Err(_)) => {
+                    match terminate_exited_command_descendants(process_id, &containment).await {
+                        Ok(()) => error(Reason::CommandRuntimeFailed),
+                        Err(()) => error(Reason::CommandCleanupFailed),
+                    }
+                }
+                Ok(Ok(status)) => {
+                    #[cfg(windows)]
+                    {
+                        completed_normally = true;
+                    }
+                    evaluate_command(
+                        status,
+                        expected_exit_code,
+                        stdout_contains,
+                        stderr_not_contains,
+                        stdout,
+                        stderr,
+                    )
+                }
+            }
+        }
+    };
+    #[cfg(unix)]
+    active_group.disarm();
+    #[cfg(windows)]
+    if completed_normally && containment.disarm().is_err() {
+        return error(Reason::CommandCleanupFailed);
     }
+    result
 }
 
 fn evaluate_command(
@@ -515,6 +584,13 @@ struct CommandContainment {
 }
 
 #[cfg(windows)]
+impl CommandContainment {
+    fn disarm(&mut self) -> Result<(), ()> {
+        self.job.disarm()
+    }
+}
+
+#[cfg(windows)]
 const _: fn() = assert_send::<CommandContainment>;
 
 #[cfg(windows)]
@@ -533,8 +609,22 @@ impl JobHandle {
         self.0 as windows_sys::Win32::Foundation::HANDLE
     }
 
-    fn identifier(&self) -> usize {
-        self.0
+    fn disarm(&mut self) -> Result<(), ()> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let configured = unsafe {
+            SetInformationJobObject(
+                self.as_raw(),
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _,
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if configured == 0 { Err(()) } else { Ok(()) }
     }
 }
 
@@ -710,6 +800,37 @@ where
 }
 
 #[cfg(unix)]
+async fn terminate_exited_command_descendants(
+    process_id: Option<u32>,
+    _containment: &CommandContainment,
+) -> Result<(), ()> {
+    let process_id = process_id.ok_or(())?.try_into().map_err(|_| ())?;
+    let groups = [process_id].into_iter().collect::<BTreeSet<_>>();
+    signal_process_groups(&groups)?;
+    wait_for_process_groups(groups).await
+}
+
+#[cfg(windows)]
+async fn terminate_exited_command_descendants(
+    _process_id: Option<u32>,
+    containment: &CommandContainment,
+) -> Result<(), ()> {
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+    if unsafe { TerminateJobObject(containment.job.as_raw(), 1) } == 0 {
+        return Err(());
+    }
+    wait_for_job_completion(&containment.job, Instant::now() + Duration::from_secs(5)).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_exited_command_descendants(
+    _process_id: Option<u32>,
+    _containment: &CommandContainment,
+) -> Result<(), ()> {
+    Err(())
+}
+
+#[cfg(unix)]
 async fn wait_for_process_groups(groups: BTreeSet<i32>) -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     wait_for_process_groups_until(groups, deadline).await
@@ -759,14 +880,36 @@ where
 {
     use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
+    let deadline = Instant::now() + Duration::from_secs(5);
     if unsafe { TerminateJobObject(containment.job.as_raw(), 1) } == 0 {
         return Err(());
     }
-    tokio::time::timeout(Duration::from_secs(5), wait)
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wait)
         .await
         .map_err(|_| ())?
         .map(|_| ())
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    wait_for_job_completion(&containment.job, deadline).await
+}
+
+#[cfg(windows)]
+async fn wait_for_job_completion(job: &JobHandle, deadline: Instant) -> Result<(), ()> {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout_milliseconds = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+    let handle = job.as_raw() as usize;
+    let result = tokio::task::spawn_blocking(move || unsafe {
+        WaitForSingleObject(handle as _, timeout_milliseconds)
+    })
+    .await
+    .map_err(|_| ())?;
+    if result == WAIT_OBJECT_0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]

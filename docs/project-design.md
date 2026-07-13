@@ -463,7 +463,7 @@ MVP はバイナリ専用 crate とし、autolib = false を設定する。公�
 
 crates.io では cargo install prepo を提供する。GitHub Releases は Git タグだけを起点に作り、通常 CI は公開しない。
 
-MVP の配布対象は x86_64/aarch64 Linux musl、x86_64/aarch64 macOS、x86_64 Windows MSVC である。Linux は musl と Rustls を使い、OpenSSL 等の動的依存を避ける。各アーカイブにはバイナリ、README、両ライセンス、SHA-256 チェックサムを含める。Windows ARM64、Homebrew/Scoop/winget、インストールスクリプト、コード署名は将来検討する。
+MVP の配布対象は x86_64/aarch64 Linux musl、x86_64/aarch64 macOS、x86_64 Windows MSVC である。Linux は musl と Rustls を使い、OpenSSL 等の動的依存を避ける。各アーカイブにはバイナリ、README、Apache-2.0 の LICENSE、SHA-256 チェックサムを含める。Windows ARM64、Homebrew/Scoop/winget、インストールスクリプト、コード署名は将来検討する。
 
 ## 16. MVP の完成条件と実装順序
 

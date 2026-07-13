@@ -17,6 +17,21 @@ fn process_is_absent_or_zombie(pid: &str) -> bool {
         .starts_with('Z')
 }
 
+#[cfg(unix)]
+struct ProcessCleanup(String);
+
+#[cfg(unix)]
+impl Drop for ProcessCleanup {
+    fn drop(&mut self) {
+        if process_is_absent_or_zombie(&self.0) {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &self.0])
+            .status();
+    }
+}
+
 fn write_config(body: &str) -> tempfile::TempDir {
     let directory = tempdir().unwrap();
     fs::write(directory.path().join("prepo.toml"), body).unwrap();
@@ -213,6 +228,67 @@ timeout_seconds = 5
     assert_eq!(value["results"][0]["outcome"], "error");
     assert_eq!(value["results"][0]["reason"], "observation_limit_exceeded");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("\0"));
+}
+
+#[cfg(unix)]
+#[test]
+fn completed_command_does_not_kill_background_processes() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "background"
+type = "command"
+name = "Background process"
+command = ["sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $! > background.pid"]
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-command", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pid = fs::read_to_string(directory.path().join("background.pid"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let _cleanup = ProcessCleanup(pid.clone());
+    assert!(!process_is_absent_or_zombie(&pid));
+}
+
+#[cfg(unix)]
+#[test]
+fn output_limit_after_direct_child_exit_cleans_descendant() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "large-background-output"
+type = "command"
+name = "Large background output"
+command = ["sh", "-c", "(echo $$ > background.pid; dd if=/dev/zero bs=1048576 count=9 2>/dev/null; sleep 30) & exit 0"]
+timeout_seconds = 5
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-command", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["reason"], "observation_limit_exceeded");
+    let pid = fs::read_to_string(directory.path().join("background.pid"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let _cleanup = ProcessCleanup(pid.clone());
+    assert!(process_is_absent_or_zombie(&pid));
 }
 
 #[cfg(unix)]

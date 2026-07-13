@@ -340,8 +340,12 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
                 spec,
             })),
             Ok(None) => checks.push(None),
-            Err(error) => {
-                errors.push(format!("check {}: {error}", check.id));
+            Err(check_errors) => {
+                errors.extend(
+                    check_errors
+                        .into_iter()
+                        .map(|error| format!("check {}: {error}", check.id)),
+                );
                 checks.push(None);
             }
         }
@@ -476,7 +480,213 @@ fn reaches(
     false
 }
 
-fn validate_check(check: &RawCheck, default_timeout_seconds: u64) -> Result<CheckSpec, String> {
+fn validate_check(
+    check: &RawCheck,
+    default_timeout_seconds: u64,
+) -> Result<CheckSpec, Vec<String>> {
+    if check.kind == "command" {
+        return validate_command(check, default_timeout_seconds);
+    }
+    let errors = collect_check_errors(check, default_timeout_seconds);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    validate_check_one(check, default_timeout_seconds).map_err(|error| vec![error])
+}
+
+fn collect_check_errors(check: &RawCheck, default_timeout_seconds: u64) -> Vec<String> {
+    let mut errors = Vec::new();
+    match check.kind.as_str() {
+        "env" => {
+            errors.extend(unrelated_errors(
+                check,
+                &["variable", "condition", "expected"],
+            ));
+            match check.variable.as_deref() {
+                Some(variable) if is_env_name(variable) => {}
+                Some(_) => errors.push("variable is invalid".to_owned()),
+                None => errors.push("variable is required".to_owned()),
+            }
+            let condition = match check.condition.as_deref().unwrap_or("exists") {
+                "exists" => Some(EnvCondition::Exists),
+                "not_exists" => Some(EnvCondition::NotExists),
+                "equals" => Some(EnvCondition::Equals),
+                "not_equals" => Some(EnvCondition::NotEquals),
+                "contains" => Some(EnvCondition::Contains),
+                "matches" => Some(EnvCondition::Matches),
+                _ => {
+                    errors.push("condition is invalid".to_owned());
+                    None
+                }
+            };
+            if let Some(condition) = condition {
+                let value_condition = matches!(
+                    condition,
+                    EnvCondition::Equals
+                        | EnvCondition::NotEquals
+                        | EnvCondition::Contains
+                        | EnvCondition::Matches
+                );
+                if value_condition != check.expected.is_some() {
+                    errors.push("expected is required only for value conditions".to_owned());
+                }
+                if let Some(expected) = &check.expected {
+                    if let Err(error) =
+                        validate_pattern(expected, matches!(condition, EnvCondition::Matches))
+                    {
+                        errors.push(error);
+                    }
+                }
+            }
+        }
+        "path" => {
+            errors.extend(unrelated_errors(check, &["path", "expected", "kind"]));
+            match check.path.as_deref() {
+                Some(path) => {
+                    if let Err(error) = validate_path_syntax(
+                        path,
+                        false,
+                        &normalise_platforms(check.platforms.as_deref())
+                            .into_iter()
+                            .collect::<Vec<_>>(),
+                    ) {
+                        errors.push(error);
+                    }
+                }
+                None => errors.push("path is required".to_owned()),
+            }
+            let expected = match check.expected.as_deref().unwrap_or("exists") {
+                "exists" => Some(PathExpected::Exists),
+                "missing" => Some(PathExpected::Missing),
+                _ => {
+                    errors.push("expected is invalid".to_owned());
+                    None
+                }
+            };
+            let kind = match check.path_kind.as_deref() {
+                Some("file" | "directory" | "any") => Some(()),
+                Some(_) => {
+                    errors.push("kind is invalid".to_owned());
+                    None
+                }
+                None => None,
+            };
+            if let Some(expected) = expected {
+                if matches!(expected, PathExpected::Exists) != kind.is_some() {
+                    errors.push("kind is required for exists and forbidden for missing".to_owned());
+                }
+            }
+        }
+        "process" => {
+            errors.extend(unrelated_errors(check, &["process", "expected"]));
+            match check.process.as_deref() {
+                Some(process) => {
+                    if let Err(error) = validate_text_value(process, 256) {
+                        errors.push(error);
+                    }
+                }
+                None => errors.push("process is required".to_owned()),
+            }
+            if !matches!(
+                check.expected.as_deref().unwrap_or("running"),
+                "running" | "stopped"
+            ) {
+                errors.push("expected is invalid".to_owned());
+            }
+            if check.timeout_seconds.is_some() {
+                errors.push("timeout_seconds is not allowed".to_owned());
+            }
+        }
+        "port" => {
+            errors.extend(unrelated_errors(
+                check,
+                &["host", "port", "expected", "timeout_seconds"],
+            ));
+            match check.host.as_deref() {
+                Some(host) if !host.is_empty() => {}
+                _ => errors.push("host is required".to_owned()),
+            }
+            if check.port.is_none() {
+                errors.push("port is required".to_owned());
+            }
+            let expected = match check.expected.as_deref().unwrap_or("open") {
+                "open" => Some(PortExpected::Open),
+                "closed" => Some(PortExpected::Closed),
+                "available" => Some(PortExpected::Available),
+                _ => {
+                    errors.push("expected is invalid".to_owned());
+                    None
+                }
+            };
+            if let Some(expected) = expected {
+                if matches!(expected, PortExpected::Available)
+                    && !matches!(
+                        check.host.as_deref(),
+                        Some("127.0.0.1" | "::1" | "0.0.0.0" | "::")
+                    )
+                {
+                    errors.push("available requires a local host".to_owned());
+                }
+                if matches!(expected, PortExpected::Available) {
+                    if check.timeout_seconds.is_some() {
+                        errors.push("timeout_seconds is not allowed for available".to_owned());
+                    }
+                } else if let Err(error) =
+                    command_timeout(check.timeout_seconds, default_timeout_seconds)
+                {
+                    errors.push(error);
+                }
+            }
+        }
+        "http" => {
+            errors.extend(unrelated_errors(
+                check,
+                &[
+                    "url",
+                    "method",
+                    "expected_status",
+                    "body_contains",
+                    "headers",
+                    "timeout_seconds",
+                ],
+            ));
+            match check.url.as_deref() {
+                Some(url) => {
+                    if let Err(error) = validate_url(url) {
+                        errors.push(error);
+                    }
+                }
+                None => errors.push("url is required".to_owned()),
+            }
+            let method = match check.method.as_deref().unwrap_or("GET") {
+                "GET" => Some(HttpMethod::Get),
+                "HEAD" => Some(HttpMethod::Head),
+                _ => {
+                    errors.push("method must be GET or HEAD".to_owned());
+                    None
+                }
+            };
+            if let Some(body_contains) = check.body_contains.as_deref() {
+                if let Err(error) = validate_pattern(body_contains, false) {
+                    errors.push(error);
+                }
+                if matches!(method, Some(HttpMethod::Head)) {
+                    errors.push("HEAD forbids body_contains".to_owned());
+                }
+            }
+            if let Err(error) = validate_headers(&check.headers.clone().unwrap_or_default()) {
+                errors.push(error);
+            }
+            if let Err(error) = command_timeout(check.timeout_seconds, default_timeout_seconds) {
+                errors.push(error);
+            }
+        }
+        _ => unreachable!("check type was validated before check fields"),
+    }
+    errors
+}
+
+fn validate_check_one(check: &RawCheck, default_timeout_seconds: u64) -> Result<CheckSpec, String> {
     let timeout = |value: Option<u64>| -> Result<u64, String> {
         let value = value.unwrap_or(default_timeout_seconds);
         if (1..=3600).contains(&value) {
@@ -551,58 +761,7 @@ fn validate_check(check: &RawCheck, default_timeout_seconds: u64) -> Result<Chec
                 kind,
             })
         }
-        "command" => {
-            reject_unrelated(
-                check,
-                &[
-                    "command",
-                    "expected_exit_code",
-                    "stdout_contains",
-                    "stderr_not_contains",
-                    "working_directory",
-                    "env",
-                    "timeout_seconds",
-                ],
-            )?;
-            let command = check
-                .command
-                .clone()
-                .filter(|parts| !parts.is_empty() && parts.len() <= 128)
-                .ok_or("command must be a non-empty array of at most 128 arguments")?;
-            if command.iter().any(|argument| {
-                argument.is_empty() || argument.len() > 8192 || has_unsafe_text(argument)
-            }) {
-                return Err("command has an invalid argument".to_owned());
-            }
-            if let Some(directory) = &check.working_directory {
-                validate_path_syntax(
-                    directory,
-                    true,
-                    &normalise_platforms(check.platforms.as_deref())
-                        .into_iter()
-                        .collect::<Vec<_>>(),
-                )?;
-            }
-            let env = check.env.clone().unwrap_or_default();
-            if env.len() > 128
-                || env.iter().any(|(key, value)| {
-                    !is_env_name(key) || value.len() > 8192 || has_unsafe_text(value)
-                })
-            {
-                return Err("env is invalid".to_owned());
-            }
-            let stdout_contains = optional_pattern(check.stdout_contains.as_deref())?;
-            let stderr_not_contains = optional_pattern(check.stderr_not_contains.as_deref())?;
-            Ok(CheckSpec::Command {
-                command,
-                expected_exit_code: check.expected_exit_code.unwrap_or(0),
-                stdout_contains,
-                stderr_not_contains,
-                working_directory: check.working_directory.clone(),
-                env,
-                timeout_seconds: timeout(check.timeout_seconds)?,
-            })
-        }
+        "command" => unreachable!("command validation is handled separately"),
         "process" => {
             reject_unrelated(check, &["process", "expected"])?;
             let process = required_string(check.process.as_deref(), "process")?;
@@ -688,7 +847,108 @@ fn validate_check(check: &RawCheck, default_timeout_seconds: u64) -> Result<Chec
     }
 }
 
+fn validate_command(
+    check: &RawCheck,
+    default_timeout_seconds: u64,
+) -> Result<CheckSpec, Vec<String>> {
+    let mut errors = Vec::new();
+    errors.extend(unrelated_errors(
+        check,
+        &[
+            "command",
+            "expected_exit_code",
+            "stdout_contains",
+            "stderr_not_contains",
+            "working_directory",
+            "env",
+            "timeout_seconds",
+        ],
+    ));
+    let command = check
+        .command
+        .clone()
+        .filter(|parts| !parts.is_empty() && parts.len() <= 128);
+    if command.is_none() {
+        errors.push("command must be a non-empty array of at most 128 arguments".to_owned());
+    }
+    if command.as_ref().is_some_and(|parts| {
+        parts.iter().any(|argument| {
+            argument.is_empty() || argument.len() > 8192 || has_unsafe_text(argument)
+        })
+    }) {
+        errors.push("command has an invalid argument".to_owned());
+    }
+    let stdout_contains = match optional_pattern(check.stdout_contains.as_deref()) {
+        Ok(pattern) => pattern,
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    let stderr_not_contains = match optional_pattern(check.stderr_not_contains.as_deref()) {
+        Ok(pattern) => pattern,
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    if let Some(directory) = &check.working_directory {
+        if let Err(error) = validate_path_syntax(
+            directory,
+            true,
+            &normalise_platforms(check.platforms.as_deref())
+                .into_iter()
+                .collect::<Vec<_>>(),
+        ) {
+            errors.push(error);
+        }
+    }
+    let env = check.env.clone().unwrap_or_default();
+    if env.len() > 128
+        || env
+            .iter()
+            .any(|(key, value)| !is_env_name(key) || value.len() > 8192 || has_unsafe_text(value))
+    {
+        errors.push("env is invalid".to_owned());
+    }
+    let timeout_seconds = match command_timeout(check.timeout_seconds, default_timeout_seconds) {
+        Ok(timeout_seconds) => timeout_seconds,
+        Err(error) => {
+            errors.push(error);
+            default_timeout_seconds
+        }
+    };
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(CheckSpec::Command {
+        command: command.expect("command was validated"),
+        expected_exit_code: check.expected_exit_code.unwrap_or(0),
+        stdout_contains,
+        stderr_not_contains,
+        working_directory: check.working_directory.clone(),
+        env,
+        timeout_seconds,
+    })
+}
+
+fn command_timeout(value: Option<u64>, default_timeout_seconds: u64) -> Result<u64, String> {
+    let value = value.unwrap_or(default_timeout_seconds);
+    if (1..=3600).contains(&value) {
+        Ok(value)
+    } else {
+        Err("timeout_seconds must be between 1 and 3600".to_owned())
+    }
+}
+
 fn reject_unrelated(check: &RawCheck, allowed: &[&str]) -> Result<(), String> {
+    unrelated_errors(check, allowed)
+        .into_iter()
+        .next()
+        .map_or(Ok(()), Err)
+}
+
+fn unrelated_errors(check: &RawCheck, allowed: &[&str]) -> Vec<String> {
     let present = [
         ("variable", check.variable.is_some()),
         ("condition", check.condition.is_some()),
@@ -711,12 +971,11 @@ fn reject_unrelated(check: &RawCheck, allowed: &[&str]) -> Result<(), String> {
         ("expected", check.expected.is_some()),
         ("timeout_seconds", check.timeout_seconds.is_some()),
     ];
-    for (field, is_present) in present {
-        if is_present && !allowed.contains(&field) {
-            return Err(format!("{field} is not allowed for this type"));
-        }
-    }
-    Ok(())
+    present
+        .into_iter()
+        .filter(|(field, is_present)| *is_present && !allowed.contains(field))
+        .map(|(field, _)| format!("{field} is not allowed for this type"))
+        .collect()
 }
 
 fn required_string<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, String> {
