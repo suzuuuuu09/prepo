@@ -255,7 +255,7 @@ command 実行のActive Command管理とcleanup状態は、一回のRunが所有
 
 Windowsでは、processをsuspendedで生成し、Job Objectへの収容に成功してからprimary threadをresumeする。
 生成後に収容またはresumeの準備が失敗した場合は、processをresumeせずcleanupする。
-CreateProcessW自体の失敗は既存の起動失敗reasonへ写像する。
+CreateProcessW自体の失敗は、実行ファイルが見つからない場合は command_not_found、実行できない場合は command_not_executable、それ以外は Error / command_runtime_failed へ写像する。
 収容処理以降の失敗は、cleanup確認に成功した場合は command_containment_failed、失敗した場合は command_cleanup_failed とする。
 
 command のlifecycle正常完了は、直接の子process回収とstdout/stderr観測の完了を意味する。

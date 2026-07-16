@@ -141,6 +141,9 @@ fn map_launch_error(error: super::LaunchError) -> ExecutionResult {
         super::LaunchError::WorkingDirectoryInvalid => {
             ExecutionResult::failed(FailureReason::WorkingDirectoryInvalid)
         }
+        super::LaunchError::RuntimeFailed => {
+            ExecutionResult::error(ErrorReason::CommandRuntimeFailed)
+        }
         super::LaunchError::ContainmentFailed => {
             ExecutionResult::error(ErrorReason::CommandContainmentFailed)
         }
@@ -243,7 +246,8 @@ fn classify_completed(
 
 #[cfg(test)]
 mod tests {
-    use super::classify_completed;
+    use super::{classify_completed, map_launch_error};
+    use crate::checks::command::LaunchError;
     use crate::checks::command::containment::ReapResult;
     use crate::config::CommandSpec;
     use crate::result::{ErrorReason, ExecutionResult, FailureReason};
@@ -300,6 +304,14 @@ mod tests {
         reap.wait_failed = true;
         assert_eq!(
             classify_completed(reap, &spec(), observed(true), observed(false)),
+            ExecutionResult::error(ErrorReason::CommandRuntimeFailed)
+        );
+    }
+
+    #[test]
+    fn unexpected_launch_failures_are_errors() {
+        assert_eq!(
+            map_launch_error(LaunchError::RuntimeFailed),
             ExecutionResult::error(ErrorReason::CommandRuntimeFailed)
         );
     }

@@ -81,14 +81,19 @@ impl CommandControl {
 
 impl CommandCleanup {
     pub(crate) async fn wait(&self) -> Result<(), CleanupFailed> {
-        let mut result = self.batch.result.clone();
-        loop {
-            if let Some(result) = *result.borrow() {
-                return result;
-            }
-            if result.changed().await.is_err() {
-                return Err(CleanupFailed);
-            }
+        wait_for_cleanup_result(self.batch.result.clone()).await
+    }
+}
+
+async fn wait_for_cleanup_result(
+    mut result: watch::Receiver<Option<Result<(), CleanupFailed>>>,
+) -> Result<(), CleanupFailed> {
+    loop {
+        if let Some(result) = *result.borrow() {
+            return result;
+        }
+        if result.changed().await.is_err() {
+            return Err(CleanupFailed);
         }
     }
 }
@@ -271,6 +276,7 @@ impl ActiveCommand {
             containment::LaunchError::WorkingDirectoryInvalid => {
                 LaunchError::WorkingDirectoryInvalid
             }
+            containment::LaunchError::RuntimeFailed => LaunchError::RuntimeFailed,
             containment::LaunchError::ContainmentFailed => LaunchError::ContainmentFailed,
             containment::LaunchError::CleanupFailed => LaunchError::CleanupFailed,
         })?;
@@ -384,15 +390,7 @@ impl ActiveCommand {
         let Some(termination) = termination else {
             return Ok(());
         };
-        let mut result = termination.result.clone();
-        loop {
-            if let Some(result) = *result.borrow() {
-                return result;
-            }
-            if result.changed().await.is_err() {
-                return Err(CleanupFailed);
-            }
-        }
+        wait_for_cleanup_result(termination.result.clone()).await
     }
 
     fn disarm(&self) -> Result<(), ()> {
@@ -413,6 +411,7 @@ enum LaunchError {
     NotFound,
     NotExecutable,
     WorkingDirectoryInvalid,
+    RuntimeFailed,
     ContainmentFailed,
     CleanupFailed,
 }

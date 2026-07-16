@@ -102,25 +102,14 @@ pub(crate) fn launch(root: &Path, spec: &CommandSpec) -> Result<Spawned, LaunchE
 
     let process = process_information.hProcess;
     let thread = process_information.hThread;
-    if unsafe { AssignProcessToJobObject(job, process) } == 0 {
-        let cleanup_ok = terminate_unstarted_process(job, process, thread);
+    if let Err(error) = establish_suspended_containment(
+        || unsafe { AssignProcessToJobObject(job, process) != 0 },
+        || unsafe { ResumeThread(thread) != u32::MAX },
+        || terminate_unstarted_process(job, process, thread),
+    ) {
         pipes.close_reads();
         close_handle(job);
-        return Err(if cleanup_ok {
-            LaunchError::ContainmentFailed
-        } else {
-            LaunchError::CleanupFailed
-        });
-    }
-    if unsafe { ResumeThread(thread) } == u32::MAX {
-        let cleanup_ok = terminate_unstarted_process(job, process, thread);
-        pipes.close_reads();
-        close_handle(job);
-        return Err(if cleanup_ok {
-            LaunchError::ContainmentFailed
-        } else {
-            LaunchError::CleanupFailed
-        });
+        return Err(error);
     }
     let started_at = Instant::now();
     close_handle(thread);
@@ -174,6 +163,28 @@ pub(crate) fn launch(root: &Path, spec: &CommandSpec) -> Result<Spawned, LaunchE
     })
 }
 
+fn establish_suspended_containment(
+    assign: impl FnOnce() -> bool,
+    resume: impl FnOnce() -> bool,
+    cleanup: impl FnOnce() -> bool,
+) -> Result<(), LaunchError> {
+    if !assign() {
+        return Err(if cleanup() {
+            LaunchError::ContainmentFailed
+        } else {
+            LaunchError::CleanupFailed
+        });
+    }
+    if !resume() {
+        return Err(if cleanup() {
+            LaunchError::ContainmentFailed
+        } else {
+            LaunchError::CleanupFailed
+        });
+    }
+    Ok(())
+}
+
 fn create_job() -> Option<HANDLE> {
     let job = unsafe { CreateJobObjectW(null(), null()) };
     if job.is_null() {
@@ -201,7 +212,7 @@ fn map_create_error(error: u32) -> LaunchError {
     match error {
         ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => LaunchError::NotFound,
         ERROR_ACCESS_DENIED | ERROR_BAD_EXE_FORMAT => LaunchError::NotExecutable,
-        _ => LaunchError::WorkingDirectoryInvalid,
+        _ => LaunchError::RuntimeFailed,
     }
 }
 
@@ -439,5 +450,59 @@ fn job_is_empty(job: HANDLE) -> bool {
 impl Drop for ContainedProcess {
     fn drop(&mut self) {
         close_handle(self.job as HANDLE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LaunchError, establish_suspended_containment, map_create_error};
+
+    #[test]
+    fn assignment_precedes_resume_and_failure_does_not_resume() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = establish_suspended_containment(
+            || {
+                events.borrow_mut().push("assign");
+                false
+            },
+            || {
+                events.borrow_mut().push("resume");
+                true
+            },
+            || {
+                events.borrow_mut().push("cleanup");
+                true
+            },
+        );
+
+        assert!(matches!(result, Err(LaunchError::ContainmentFailed)));
+        assert_eq!(events.into_inner(), ["assign", "cleanup"]);
+    }
+
+    #[test]
+    fn resume_failure_cleans_up_without_reporting_success() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = establish_suspended_containment(
+            || {
+                events.borrow_mut().push("assign");
+                true
+            },
+            || {
+                events.borrow_mut().push("resume");
+                false
+            },
+            || {
+                events.borrow_mut().push("cleanup");
+                false
+            },
+        );
+
+        assert!(matches!(result, Err(LaunchError::CleanupFailed)));
+        assert_eq!(events.into_inner(), ["assign", "resume", "cleanup"]);
+    }
+
+    #[test]
+    fn unknown_create_errors_are_runtime_failures() {
+        assert!(matches!(map_create_error(1234), LaunchError::RuntimeFailed));
     }
 }

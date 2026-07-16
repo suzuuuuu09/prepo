@@ -297,7 +297,9 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
         .collect::<HashMap<_, _>>();
     let mut seen_ids = BTreeSet::new();
     let mut checks = Vec::with_capacity(raw.checks.len());
+    let mut check_errors = vec![Vec::new(); raw.checks.len()];
     for (index, check) in raw.checks.iter().enumerate() {
+        let errors = &mut check_errors[index];
         if !is_kebab_case(&check.id) || check.id.len() > 64 {
             errors.push(format!("check {} has an invalid id", index + 1));
         }
@@ -308,14 +310,14 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
         if !type_is_valid {
             errors.push(format!("check {}: type is invalid", check.id));
         }
-        validate_text("checks.name", &check.name, 256, &mut errors);
+        validate_text("checks.name", &check.name, 256, errors);
         if let Some(group) = &check.group {
             if !is_kebab_case(group) || group.len() > 64 {
                 errors.push(format!("check {} has an invalid group", check.id));
             }
         }
         if let Some(help) = &check.help {
-            validate_text("checks.help", help, 2048, &mut errors);
+            validate_text("checks.help", help, 2048, errors);
         }
         if let Some(platforms) = &check.platforms {
             if platforms.is_empty() || platforms.len() > 3 || has_duplicates(platforms) {
@@ -373,6 +375,9 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
         if let Some(validated_check) = checks[index].as_mut() {
             validated_check.depends_on = dependencies;
         }
+    }
+    for errors_for_check in check_errors {
+        errors.extend(errors_for_check);
     }
     validate_graph(&checks, &mut errors);
     if !errors.is_empty() {
@@ -494,7 +499,7 @@ fn validate_check(
     if !errors.is_empty() {
         return Err(errors);
     }
-    validate_check_one(check, default_timeout_seconds).map_err(|error| vec![error])
+    Ok(build_check_spec(check, default_timeout_seconds))
 }
 
 fn collect_check_errors(check: &RawCheck, default_timeout_seconds: u64) -> Vec<String> {
@@ -689,22 +694,10 @@ fn collect_check_errors(check: &RawCheck, default_timeout_seconds: u64) -> Vec<S
     errors
 }
 
-fn validate_check_one(check: &RawCheck, default_timeout_seconds: u64) -> Result<CheckSpec, String> {
-    let timeout = |value: Option<u64>| -> Result<u64, String> {
-        let value = value.unwrap_or(default_timeout_seconds);
-        if (1..=3600).contains(&value) {
-            Ok(value)
-        } else {
-            Err("timeout_seconds must be between 1 and 3600".to_owned())
-        }
-    };
+fn build_check_spec(check: &RawCheck, default_timeout_seconds: u64) -> CheckSpec {
     match check.kind.as_str() {
         "env" => {
-            reject_unrelated(check, &["variable", "condition", "expected"])?;
-            let variable = required_string(check.variable.as_deref(), "variable")?;
-            if !is_env_name(variable) {
-                return Err("variable is invalid".to_owned());
-            }
+            let variable = check.variable.as_ref().expect("variable was validated");
             let condition = match check.condition.as_deref().unwrap_or("exists") {
                 "exists" => EnvCondition::Exists,
                 "not_exists" => EnvCondition::NotExists,
@@ -712,139 +705,90 @@ fn validate_check_one(check: &RawCheck, default_timeout_seconds: u64) -> Result<
                 "not_equals" => EnvCondition::NotEquals,
                 "contains" => EnvCondition::Contains,
                 "matches" => EnvCondition::Matches,
-                _ => return Err("condition is invalid".to_owned()),
+                _ => unreachable!("condition was validated"),
             };
-            let value_condition = matches!(
-                condition,
-                EnvCondition::Equals
-                    | EnvCondition::NotEquals
-                    | EnvCondition::Contains
-                    | EnvCondition::Matches
-            );
-            if value_condition != check.expected.is_some() {
-                return Err("expected is required only for value conditions".to_owned());
-            }
-            if let Some(expected) = &check.expected {
-                validate_pattern(expected, matches!(condition, EnvCondition::Matches))?;
-            }
-            Ok(CheckSpec::Env {
-                variable: variable.to_owned(),
+            CheckSpec::Env {
+                variable: variable.clone(),
                 condition,
                 expected: check.expected.clone(),
-            })
+            }
         }
         "path" => {
-            reject_unrelated(check, &["path", "expected", "kind"])?;
-            let path = required_string(check.path.as_deref(), "path")?;
-            validate_path_syntax(
-                path,
-                false,
-                &normalise_platforms(check.platforms.as_deref())
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-            )?;
+            let path = check.path.as_ref().expect("path was validated");
             let expected = match check.expected.as_deref().unwrap_or("exists") {
                 "exists" => PathExpected::Exists,
                 "missing" => PathExpected::Missing,
-                _ => return Err("expected is invalid".to_owned()),
+                _ => unreachable!("expected was validated"),
             };
             let kind = match check.path_kind.as_deref() {
                 Some("file") => Some(PathKind::File),
                 Some("directory") => Some(PathKind::Directory),
                 Some("any") => Some(PathKind::Any),
-                Some(_) => return Err("kind is invalid".to_owned()),
+                Some(_) => unreachable!("kind was validated"),
                 None => None,
             };
-            if matches!(expected, PathExpected::Exists) != kind.is_some() {
-                return Err("kind is required for exists and forbidden for missing".to_owned());
-            }
-            Ok(CheckSpec::Path {
-                path: path.to_owned(),
+            CheckSpec::Path {
+                path: path.clone(),
                 expected,
                 kind,
-            })
+            }
         }
         "command" => unreachable!("command validation is handled separately"),
         "process" => {
-            reject_unrelated(check, &["process", "expected"])?;
-            let process = required_string(check.process.as_deref(), "process")?;
-            validate_text_value(process, 256)?;
+            let process = check.process.as_ref().expect("process was validated");
             let expected = match check.expected.as_deref().unwrap_or("running") {
                 "running" => ProcessExpected::Running,
                 "stopped" => ProcessExpected::Stopped,
-                _ => return Err("expected is invalid".to_owned()),
+                _ => unreachable!("expected was validated"),
             };
-            if check.timeout_seconds.is_some() {
-                return Err("timeout_seconds is not allowed".to_owned());
-            }
-            Ok(CheckSpec::Process {
-                process: process.to_owned(),
+            CheckSpec::Process {
+                process: process.clone(),
                 expected,
-            })
+            }
         }
         "port" => {
-            reject_unrelated(check, &["host", "port", "expected", "timeout_seconds"])?;
-            let host = required_string(check.host.as_deref(), "host")?;
-            let port = check.port.ok_or("port is required")?;
+            let host = check.host.as_ref().expect("host was validated");
+            let port = check.port.expect("port was validated");
             let expected = match check.expected.as_deref().unwrap_or("open") {
                 "open" => PortExpected::Open,
                 "closed" => PortExpected::Closed,
                 "available" => PortExpected::Available,
-                _ => return Err("expected is invalid".to_owned()),
+                _ => unreachable!("expected was validated"),
             };
-            if matches!(expected, PortExpected::Available)
-                && !matches!(host, "127.0.0.1" | "::1" | "0.0.0.0" | "::")
-            {
-                return Err("available requires a local host".to_owned());
-            }
             let timeout_seconds = if matches!(expected, PortExpected::Available) {
-                if check.timeout_seconds.is_some() {
-                    return Err("timeout_seconds is not allowed for available".to_owned());
-                }
                 None
             } else {
-                Some(timeout(check.timeout_seconds)?)
+                Some(
+                    command_timeout(check.timeout_seconds, default_timeout_seconds)
+                        .expect("timeout was validated"),
+                )
             };
-            Ok(CheckSpec::Port {
-                host: host.to_owned(),
+            CheckSpec::Port {
+                host: host.clone(),
                 port,
                 expected,
                 timeout_seconds,
-            })
+            }
         }
         "http" => {
-            reject_unrelated(
-                check,
-                &[
-                    "url",
-                    "method",
-                    "expected_status",
-                    "body_contains",
-                    "headers",
-                    "timeout_seconds",
-                ],
-            )?;
-            let url = required_string(check.url.as_deref(), "url")?;
-            validate_url(url)?;
+            let url = check.url.as_ref().expect("url was validated");
             let method = match check.method.as_deref().unwrap_or("GET") {
                 "GET" => HttpMethod::Get,
                 "HEAD" => HttpMethod::Head,
-                _ => return Err("method must be GET or HEAD".to_owned()),
+                _ => unreachable!("method was validated"),
             };
-            let body_contains = optional_pattern(check.body_contains.as_deref())?;
-            if matches!(method, HttpMethod::Head) && body_contains.is_some() {
-                return Err("HEAD forbids body_contains".to_owned());
-            }
+            let body_contains = optional_pattern(check.body_contains.as_deref())
+                .expect("body_contains was validated");
             let headers = check.headers.clone().unwrap_or_default();
-            validate_headers(&headers)?;
-            Ok(CheckSpec::Http {
-                url: url.to_owned(),
+            CheckSpec::Http {
+                url: url.clone(),
                 method,
                 expected_status: check.expected_status.unwrap_or(200),
                 body_contains,
                 headers,
-                timeout_seconds: timeout(check.timeout_seconds)?,
-            })
+                timeout_seconds: command_timeout(check.timeout_seconds, default_timeout_seconds)
+                    .expect("timeout was validated"),
+            }
         }
         _ => unreachable!("check type was validated before check fields"),
     }
@@ -944,13 +888,6 @@ fn command_timeout(value: Option<u64>, default_timeout_seconds: u64) -> Result<u
     }
 }
 
-fn reject_unrelated(check: &RawCheck, allowed: &[&str]) -> Result<(), String> {
-    unrelated_errors(check, allowed)
-        .into_iter()
-        .next()
-        .map_or(Ok(()), Err)
-}
-
 fn unrelated_errors(check: &RawCheck, allowed: &[&str]) -> Vec<String> {
     let present = [
         ("variable", check.variable.is_some()),
@@ -981,11 +918,6 @@ fn unrelated_errors(check: &RawCheck, allowed: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn required_string<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, String> {
-    value
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{field} is required"))
-}
 fn optional_pattern(value: Option<&str>) -> Result<Option<Vec<u8>>, String> {
     value
         .map(|value| {

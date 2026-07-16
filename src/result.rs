@@ -159,7 +159,10 @@ categorized_reasons!(ErrorReason {
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExecutionResult {
+pub(crate) struct ExecutionResult(ExecutionState);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutionState {
     Passed,
     Failed(FailureReason),
     Error(ErrorReason),
@@ -167,30 +170,30 @@ pub(crate) enum ExecutionResult {
 
 impl ExecutionResult {
     pub(crate) const fn passed() -> Self {
-        Self::Passed
+        Self(ExecutionState::Passed)
     }
 
     pub(crate) const fn failed(reason: FailureReason) -> Self {
-        Self::Failed(reason)
+        Self(ExecutionState::Failed(reason))
     }
 
     pub(crate) const fn error(reason: ErrorReason) -> Self {
-        Self::Error(reason)
+        Self(ExecutionState::Error(reason))
     }
 
     pub(crate) const fn outcome(self) -> Outcome {
-        match self {
-            Self::Passed => Outcome::Passed,
-            Self::Failed(_) => Outcome::Failed,
-            Self::Error(_) => Outcome::Error,
+        match self.0 {
+            ExecutionState::Passed => Outcome::Passed,
+            ExecutionState::Failed(_) => Outcome::Failed,
+            ExecutionState::Error(_) => Outcome::Error,
         }
     }
 
     pub(crate) fn reason(self) -> Option<Reason> {
-        match self {
-            Self::Passed => None,
-            Self::Failed(reason) => Some(reason.as_reason()),
-            Self::Error(reason) => Some(reason.as_reason()),
+        match self.0 {
+            ExecutionState::Passed => None,
+            ExecutionState::Failed(reason) => Some(reason.as_reason()),
+            ExecutionState::Error(reason) => Some(reason.as_reason()),
         }
     }
 }

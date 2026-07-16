@@ -151,7 +151,7 @@ fn check(
         Ok(run) => run,
         Err(Err(Interrupted::CtrlC { cleanup_failed })) => {
             if cleanup_failed {
-                eprintln!("warning: command cleanup may have failed");
+                eprintln!("warning: command cleanup failed; command processes may remain");
             }
             eprintln!("Interrupted.");
             return 130;
@@ -159,7 +159,7 @@ fn check(
         #[cfg(unix)]
         Err(Err(Interrupted::Sigterm { cleanup_failed })) => {
             if cleanup_failed {
-                eprintln!("warning: command cleanup may have failed");
+                eprintln!("warning: command cleanup failed; command processes may remain");
             }
             eprintln!("Interrupted.");
             return 143;
@@ -231,13 +231,19 @@ async fn run_until_interrupted(
         tokio::pin!(engine);
         tokio::select! {
             biased;
-            _ = &mut ctrl_c => {
-                let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control, &mut sigterm).await;
-                Err(Err(Interrupted::CtrlC { cleanup_failed }))
+            signal = &mut ctrl_c => match signal {
+                Ok(()) => {
+                    let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control, &mut sigterm).await;
+                    Err(Err(Interrupted::CtrlC { cleanup_failed }))
+                }
+                Err(_) => Err(Err(Interrupted::Internal)),
             },
-            _ = sigterm.recv() => {
-                let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control, &mut sigterm).await;
-                Err(Err(Interrupted::Sigterm { cleanup_failed }))
+            signal = sigterm.recv() => match signal {
+                Some(()) => {
+                    let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control, &mut sigterm).await;
+                    Err(Err(Interrupted::Sigterm { cleanup_failed }))
+                }
+                None => Err(Err(Interrupted::Internal)),
             },
             run = &mut engine => match run {
                 Ok(run) => Ok(run),
@@ -256,9 +262,12 @@ async fn run_until_interrupted(
         tokio::pin!(engine);
         tokio::select! {
             biased;
-            _ = &mut ctrl_c => {
-                let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control).await;
-                Err(Err(Interrupted::CtrlC { cleanup_failed }))
+            signal = &mut ctrl_c => match signal {
+                Ok(()) => {
+                    let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control).await;
+                    Err(Err(Interrupted::CtrlC { cleanup_failed }))
+                }
+                Err(_) => Err(Err(Interrupted::Internal)),
             },
             run = &mut engine => match run {
                 Ok(run) => Ok(run),
@@ -279,11 +288,19 @@ async fn wait_for_cleanup_or_second_signal(
     let cleanup = control.begin_cleanup();
     let wait = cleanup.wait();
     tokio::pin!(wait);
+    let second_ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(second_ctrl_c);
     tokio::select! {
         biased;
         result = &mut wait => result.is_err(),
-        _ = tokio::signal::ctrl_c() => control.force_terminate().is_err(),
-        _ = sigterm.recv() => control.force_terminate().is_err(),
+        signal = &mut second_ctrl_c => match signal {
+            Ok(()) => control.force_terminate().is_err(),
+            Err(_) => wait.await.is_err(),
+        },
+        signal = sigterm.recv() => match signal {
+            Some(()) => control.force_terminate().is_err(),
+            None => wait.await.is_err(),
+        },
     }
 }
 
@@ -297,7 +314,10 @@ async fn wait_for_cleanup_or_second_signal(control: &checks::command::CommandCon
     tokio::select! {
         biased;
         result = &mut wait => result.is_err(),
-        _ = &mut second_signal => control.force_terminate().is_err(),
+        signal = &mut second_signal => match signal {
+            Ok(()) => control.force_terminate().is_err(),
+            Err(_) => wait.await.is_err(),
+        },
     }
 }
 

@@ -26,6 +26,7 @@ pub(super) enum LaunchError {
     NotFound,
     NotExecutable,
     WorkingDirectoryInvalid,
+    RuntimeFailed,
     ContainmentFailed,
     CleanupFailed,
 }

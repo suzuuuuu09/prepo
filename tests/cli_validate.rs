@@ -362,6 +362,53 @@ kind = "directory"
 }
 
 #[test]
+fn validate_reports_dependency_errors_in_check_declaration_order() {
+    let directory = tempdir().expect("temporary directory");
+    fs::write(
+        directory.path().join("prepo.toml"),
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "first"
+type = "path"
+name = "First"
+path = "."
+expected = "exists"
+kind = "directory"
+depends_on = ["missing"]
+[[checks]]
+id = "second"
+type = "path"
+name = "Second"
+platforms = []
+path = "."
+expected = "exists"
+kind = "directory"
+"#,
+    )
+    .expect("configuration");
+
+    let output = Command::cargo_bin("prepo")
+        .expect("prepo binary")
+        .current_dir(directory.path())
+        .arg("validate")
+        .output()
+        .expect("prepo output");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let dependency = stderr
+        .find("first depends on unknown check missing")
+        .unwrap();
+    let second = stderr.find("check second has invalid platforms").unwrap();
+    assert!(
+        dependency < second,
+        "errors were reported out of order: {stderr}"
+    );
+}
+
+#[test]
 fn validate_reports_platform_errors_before_type_specific_fields() {
     let directory = tempdir().expect("temporary directory");
     fs::write(

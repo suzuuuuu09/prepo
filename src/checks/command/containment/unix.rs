@@ -14,19 +14,23 @@ pub(crate) struct ContainedProcess {
 }
 
 pub(crate) fn launch(root: &Path, spec: &CommandSpec) -> Result<Spawned, LaunchError> {
+    let working_directory = root.join(spec.working_directory.as_deref().unwrap_or("."));
+    if !working_directory.is_dir() {
+        return Err(LaunchError::WorkingDirectoryInvalid);
+    }
     let mut command = tokio::process::Command::new(&spec.command[0]);
     command
         .args(&spec.command[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .current_dir(root.join(spec.working_directory.as_deref().unwrap_or(".")))
+        .current_dir(working_directory)
         .envs(&spec.environment_overrides);
     command.as_std_mut().process_group(0);
     let mut child = command.spawn().map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => LaunchError::NotFound,
         std::io::ErrorKind::PermissionDenied => LaunchError::NotExecutable,
-        _ => LaunchError::WorkingDirectoryInvalid,
+        _ => LaunchError::RuntimeFailed,
     })?;
     let started_at = Instant::now();
     let group = child.id().ok_or(LaunchError::ContainmentFailed)?;

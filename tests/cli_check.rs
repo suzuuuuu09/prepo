@@ -200,6 +200,33 @@ timeout_seconds = 1
     assert_eq!(value["results"][0]["reason"], "timed_out");
 }
 
+#[test]
+fn command_with_an_invalid_working_directory_has_a_dedicated_failure_reason() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "invalid-directory"
+type = "command"
+name = "Invalid directory"
+command = ["echo", "ok"]
+working_directory = "does-not-exist"
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-command", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "failed");
+    assert_eq!(value["results"][0]["reason"], "working_directory_invalid");
+}
+
 #[cfg(unix)]
 #[test]
 fn command_output_limit_is_a_check_error_without_retaining_output() {
