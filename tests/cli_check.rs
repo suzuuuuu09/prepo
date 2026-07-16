@@ -200,6 +200,34 @@ timeout_seconds = 1
     assert_eq!(value["results"][0]["reason"], "timed_out");
 }
 
+#[cfg(windows)]
+#[test]
+fn command_runs_after_job_assignment_and_reports_success() {
+    let directory = write_config(
+        r#"version = 1
+[project]
+name = "example"
+[[checks]]
+id = "contained-command"
+type = "command"
+name = "Contained command"
+command = ["cmd", "/C", "echo ready"]
+stdout_contains = "ready"
+"#,
+    );
+    let output = Command::cargo_bin("prepo")
+        .unwrap()
+        .current_dir(directory.path())
+        .args(["check", "--allow-command", "--format", "json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["results"][0]["outcome"], "passed");
+    assert_eq!(value["results"][0]["reason"], Value::Null);
+}
+
 #[test]
 fn command_with_an_invalid_working_directory_has_a_dedicated_failure_reason() {
     let directory = write_config(
