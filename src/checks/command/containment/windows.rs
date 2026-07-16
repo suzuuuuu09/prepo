@@ -333,10 +333,24 @@ fn wide_path(path: &Path) -> Vec<u16> {
 fn command_line(arguments: &[String]) -> Vec<u16> {
     let text = arguments
         .iter()
-        .map(|argument| quote_argument(argument))
+        .enumerate()
+        .map(|(index, argument)| {
+            if index == 0 || needs_quotes(argument) {
+                quote_argument(argument)
+            } else {
+                argument.clone()
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ");
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn needs_quotes(argument: &str) -> bool {
+    argument.is_empty()
+        || argument
+            .chars()
+            .any(|character| matches!(character, ' ' | '\t' | '"'))
 }
 
 fn quote_argument(argument: &str) -> String {
@@ -455,7 +469,16 @@ impl Drop for ContainedProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchError, establish_suspended_containment, map_create_error};
+    use super::{LaunchError, command_line, establish_suspended_containment, map_create_error};
+
+    #[test]
+    fn command_line_leaves_cmd_switches_unquoted() {
+        let arguments = ["cmd".to_owned(), "/C".to_owned(), "echo ready".to_owned()];
+        let line = command_line(&arguments);
+        let text = String::from_utf16(&line[..line.len() - 1]).unwrap();
+
+        assert_eq!(text, r#""cmd" /C "echo ready""#);
+    }
 
     #[test]
     fn assignment_precedes_resume_and_failure_does_not_resume() {
