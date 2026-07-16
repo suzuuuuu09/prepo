@@ -1,93 +1,10 @@
+use crate::checks::command::{CommandRunner, RunCleaningUp};
 use crate::config::{Check, CheckSpec, EnvCondition, Platform, ValidatedConfig};
+use crate::result::{ExecutionResult, Outcome, Reason};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Outcome {
-    Passed,
-    Failed,
-    Error,
-    PermissionDenied,
-    NotApplicable,
-    Blocked,
-}
-
-macro_rules! reason_codes {
-    ($($variant:ident => $wire:literal),+ $(,)?) => {
-        #[allow(dead_code)]
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-        pub enum Reason {
-            $(#[serde(rename = $wire)] $variant),+
-        }
-
-        impl Reason {
-            pub fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $wire),+
-                }
-            }
-        }
-    };
-}
-
-reason_codes! {
-    PlatformNotApplicable => "platform_not_applicable",
-    DependencyNotPassed => "dependency_not_passed",
-    PermissionMissing => "permission_missing",
-    EnvironmentVariableMissing => "environment_variable_missing",
-    EnvironmentVariablePresent => "environment_variable_present",
-    EnvironmentValueMismatch => "environment_value_mismatch",
-    EnvironmentValueForbidden => "environment_value_forbidden",
-    EnvironmentSubstringMissing => "environment_substring_missing",
-    EnvironmentPatternMismatch => "environment_pattern_mismatch",
-    NonUnicodeEnvironmentValue => "non_unicode_environment_value",
-    EnvironmentReadFailed => "environment_read_failed",
-    PathMissing => "path_missing",
-    PathPresent => "path_present",
-    PathKindMismatch => "path_kind_mismatch",
-    BrokenSymlink => "broken_symlink",
-    PathMetadataFailed => "path_metadata_failed",
-    SymlinkLoop => "symlink_loop",
-    CommandNotFound => "command_not_found",
-    CommandNotExecutable => "command_not_executable",
-    WorkingDirectoryInvalid => "working_directory_invalid",
-    TimedOut => "timed_out",
-    CommandTerminated => "command_terminated",
-    ExitCodeMismatch => "exit_code_mismatch",
-    StdoutConditionMismatch => "stdout_condition_mismatch",
-    StderrConditionMismatch => "stderr_condition_mismatch",
-    CommandContainmentFailed => "command_containment_failed",
-    CommandCleanupFailed => "command_cleanup_failed",
-    CommandOutputReadFailed => "command_output_read_failed",
-    CommandRuntimeFailed => "command_runtime_failed",
-    ObservationLimitExceeded => "observation_limit_exceeded",
-    ProcessNotRunning => "process_not_running",
-    ProcessUnexpectedlyRunning => "process_unexpectedly_running",
-    ProcessEnumerationFailed => "process_enumeration_failed",
-    PortNotOpen => "port_not_open",
-    PortNotClosed => "port_not_closed",
-    PortUnavailable => "port_unavailable",
-    PortBindFailed => "port_bind_failed",
-    PortConnectFailed => "port_connect_failed",
-    PortNameResolutionFailed => "port_name_resolution_failed",
-    ConnectionStateIndeterminate => "connection_state_indeterminate",
-    DnsResolutionFailed => "dns_resolution_failed",
-    HttpConnectionFailed => "http_connection_failed",
-    TlsValidationFailed => "tls_validation_failed",
-    HttpStatusMismatch => "http_status_mismatch",
-    HttpBodyMismatch => "http_body_mismatch",
-    MissingEnvironmentVariable => "missing_environment_variable",
-    HttpClientBuildFailed => "http_client_build_failed",
-    HttpBodyReadFailed => "http_body_read_failed",
-    BodyDecodeFailed => "body_decode_failed",
-    UnsupportedContentEncoding => "unsupported_content_encoding",
-    InvalidExpandedHeaderValue => "invalid_expanded_header_value",
-    ExpandedHeaderTooLarge => "expanded_header_too_large",
-    HttpRuntimeFailed => "http_runtime_failed",
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,12 +38,6 @@ pub struct Run {
     pub total_duration_ms: u128,
 }
 
-pub(crate) struct ExecutionResult {
-    pub(crate) outcome: Outcome,
-    pub(crate) reason: Option<Reason>,
-    pub(crate) summary: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Readiness {
     Ready,
@@ -148,21 +59,23 @@ pub enum SelectionError {
     EmptyGroup(String),
 }
 
-#[cfg(not(unix))]
-pub(crate) use crate::checks::terminate_active_commands;
-#[cfg(unix)]
-pub(crate) use crate::checks::{begin_terminate_active_commands, wait_for_active_commands};
+pub enum RunError {
+    Selection(SelectionError),
+    CleaningUp,
+    Internal,
+}
 
 pub async fn run(
+    command_runner: &CommandRunner,
     config: &ValidatedConfig,
     ids: &[String],
     group: Option<&str>,
     permissions: Permissions,
     sequential: bool,
-) -> Result<Run, SelectionError> {
+) -> Result<Run, RunError> {
     let full = ids.is_empty() && group.is_none();
     debug_assert!((1..=3600).contains(&config.runner.default_timeout_seconds));
-    let explicit = select(config, ids, group)?;
+    let explicit = select(config, ids, group).map_err(RunError::Selection)?;
     let selected = include_dependencies(config, &explicit);
     let started = Instant::now();
     let current_platform = Platform::current().expect("unsupported OS is checked by the CLI");
@@ -186,11 +99,13 @@ pub async fn run(
                 break;
             };
             let config = Arc::clone(&config);
+            let command_runner = command_runner.clone();
             let row_snapshot = rows.clone();
             let is_explicit = explicit.contains(&index);
             tasks.spawn(async move {
                 let check = &config.checks[index];
                 let result = run_one(
+                    &command_runner,
                     &config,
                     check,
                     &row_snapshot,
@@ -205,8 +120,20 @@ pub async fn run(
             remaining.remove(&index);
         }
         if let Some(joined) = tasks.join_next().await {
-            let (index, result) = joined.expect("check task must not panic");
-            rows[index] = Some(result);
+            let (index, result) = match joined {
+                Ok(value) => value,
+                Err(_) => {
+                    tasks.abort_all();
+                    return Err(RunError::Internal);
+                }
+            };
+            match result {
+                Ok(result) => rows[index] = Some(result),
+                Err(RunCleaningUp) => {
+                    tasks.abort_all();
+                    return Err(RunError::CleaningUp);
+                }
+            }
         } else {
             break;
         }
@@ -270,6 +197,7 @@ fn include_dependencies(config: &ValidatedConfig, explicit: &BTreeSet<usize>) ->
 
 #[allow(clippy::too_many_arguments)]
 async fn run_one(
+    command_runner: &CommandRunner,
     config: &ValidatedConfig,
     check: &Check,
     rows: &[Option<ResultRow>],
@@ -277,7 +205,7 @@ async fn run_one(
     explicit: bool,
     full: bool,
     permissions: Permissions,
-) -> ResultRow {
+) -> Result<ResultRow, RunCleaningUp> {
     let selection = (!full).then_some(if explicit {
         Selection::Explicit
     } else {
@@ -298,14 +226,14 @@ async fn run_one(
         selection,
     };
     if !check.platforms.contains(&platform) {
-        return base(
+        return Ok(base(
             Outcome::NotApplicable,
             Some(Reason::PlatformNotApplicable),
             "Platform does not apply.".to_owned(),
             0,
             vec![],
             vec![],
-        );
+        ));
     }
     let blocked_by = check
         .depends_on
@@ -318,42 +246,49 @@ async fn run_one(
         })
         .collect::<Vec<_>>();
     if !blocked_by.is_empty() {
-        return base(
+        return Ok(base(
             Outcome::Blocked,
             Some(Reason::DependencyNotPassed),
             "A dependency did not pass.".to_owned(),
             0,
             blocked_by,
             vec![],
-        );
+        ));
     }
     let missing_permissions = permissions_for(&check.spec, permissions);
     if !missing_permissions.is_empty() {
-        return base(
+        return Ok(base(
             Outcome::PermissionDenied,
             Some(Reason::PermissionMissing),
             "Required permission was not granted.".to_owned(),
             0,
             vec![],
             missing_permissions,
-        );
+        ));
     }
     let started = Instant::now();
-    let result = crate::checks::execute(config, check).await;
-    base(
-        result.outcome,
-        result.reason,
-        result.summary,
+    let result = crate::checks::execute(command_runner, config, check).await?;
+    Ok(base(
+        result.outcome(),
+        result.reason(),
+        summary(result),
         started.elapsed().as_millis(),
         vec![],
         vec![],
-    )
+    ))
+}
+
+fn summary(result: ExecutionResult) -> String {
+    match result.reason() {
+        None => "Check passed.".to_owned(),
+        Some(reason) => reason.as_str().replace('_', " "),
+    }
 }
 
 fn permissions_for(spec: &CheckSpec, permissions: Permissions) -> Vec<&'static str> {
     let mut missing = Vec::new();
     match spec {
-        CheckSpec::Command { .. } if !permissions.command => missing.push("--allow-command"),
+        CheckSpec::Command(_) if !permissions.command => missing.push("--allow-command"),
         CheckSpec::Port { .. } if !permissions.network => missing.push("--allow-network"),
         CheckSpec::Http { headers, .. } => {
             if !permissions.network {

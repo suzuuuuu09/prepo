@@ -247,6 +247,21 @@ command は空でない引数配列であり、シェルを介さず先頭要素
 
 通常の子孫プロセスは Unix の専用プロセスグループ、Windows の Job Object に入れ、タイムアウト・観測上限・中断時に終了する。隔離を確立できなければ起動しない。意図的に隔離から脱出する敵対的コマンドは MVP の脅威モデル外であり、allow-command はサンドボックスではない。
 
+command 実行のActive Command管理とcleanup状態は、一回のRunが所有する。
+評価futureがキャンセルされても、Active Commandは正常なlifecycle完了時だけregistryから外れる。
+直接の子processはprivate reaperだけが回収し、lifecycleとcleanupは同じ回収結果を参照する。
+タイムアウトとRun中断は、同じActive Commandの停止状態、停止要求時からの固定5秒deadline、停止確認結果を共有する。
+停止要求は再送できるが、直接の子process回収とcontainment確認は一度だけ行う。
+
+Windowsでは、processをsuspendedで生成し、Job Objectへの収容に成功してからprimary threadをresumeする。
+生成後に収容またはresumeの準備が失敗した場合は、processをresumeせずcleanupする。
+CreateProcessW自体の失敗は既存の起動失敗reasonへ写像する。
+収容処理以降の失敗は、cleanup確認に成功した場合は command_containment_failed、失敗した場合は command_cleanup_failed とする。
+
+command のlifecycle正常完了は、直接の子process回収とstdout/stderr観測の完了を意味する。
+終了コードまたは出力条件の不一致でFailedになっても、lifecycleが正常ならcontainmentをdisarmする。
+disarmに失敗した場合は、同じ停止処理でcleanupを試み、最終結果を Error / command_cleanup_failed とする。
+
 ### 7.4 process
 
 process は OS が報告するプロセス名を大文字・小文字を区別して完全一致で確認する。
@@ -320,7 +335,16 @@ ID 列挙または group は Partial Run である。全体の readiness を判�
 
 ### 8.3 中断
 
-check は Ctrl-C を、Unix では SIGTERM も処理する。最初のシグナルでは新規起動を止め、HTTP/TCP を中断し、管理中の command ツリーを終了して最大 5 秒待つ。不完全な結果は stdout に出さず、stderr に安全な Interrupted. を出す。Ctrl-C は 130、SIGTERM は 143。二回目のシグナルは同期的な best-effort 終了後ただちに終了する。
+main はRun全体のsupervisorであり、engineを直接所有してsignal待機と競合させる。
+signal listenerはengineをpollする前に初期化し、同一pollでsignalとengine完了が準備済みならsignalを優先する。
+listener初期化に失敗した場合は、チェックを開始せずPrepo Errorとして終了コード3を返す。
+
+最初のCtrl-CまたはUnix SIGTERMでは、engine futureと未完了check taskを破棄し、新規起動を止め、HTTP/TCPを中断し、Run-scoped cleanup batchを開始する。
+cleanup batchはその時点のActive Command snapshotを持ち、停止要求と最大5秒の停止確認を所有する。
+不完全な結果はstdoutへ出さず、stderrへ安全な Interrupted. を出す。
+Ctrl-Cは130、SIGTERMは143を返す。
+二回目のsignalは同じcleanup batchへbest-effort停止を再送して直ちに終了する。
+cleanup失敗はwarningを出すが、終了コードは最初のsignal種別から変えない。
 
 ## 9. Active Check と秘密情報
 
@@ -356,6 +380,11 @@ Blocked
 Error はチェック単位の判定不能であり、他のチェックは継続する。Prepo Error は診断全体を信頼して継続できない内部障害であり、Check Outcome ではない。必須の Failed/Error/PermissionDenied/Blocked は表示上 Failed、任意の同結果は Warning となる。
 
 reason は閉じた機械可読 enum である。Rust では PascalCase、JSON では snake_case を使う。Passed の reason は null、他は非 null。OS やライブラリの生エラー文を reason に入れない。同じ output_schema_version 内で既存 reason の意味を変更・削除しない。
+
+内部の客観的実行結果は Passed、Failed(FailureReason)、Error(ErrorReason) の閉じた表現とする。
+constructor以外から生成できず、Passedにreasonを持たせたり、FailedとErrorに対応しないreasonを組み合わせたりできない。
+PermissionDenied、Not Applicable、BlockedはRunポリシーで生成し、客観的実行結果には含めない。
+summaryは客観的実行結果へ保持せず、engineが既存の固定規則から導出する。
 
 ### 10.1 Outcome と reason の完全な対応表
 
@@ -439,8 +468,12 @@ MVP はバイナリ専用 crate とし、autolib = false を設定する。公�
 
 - CLI、アプリケーション制御、設定読込、RawConfig/ValidatedConfig、結果モデル、実行計画・scheduler・readiness、各チェック、出力 renderer/sanitizer、OS 固有プロセス隔離を分離する。
 - 各チェック種別はタグ付き enum で分岐する。trait object、async-trait、外部プラグイン API は使わない。
-- checks は客観的 Outcome だけを返す。required による表示と終了コードは engine が導出し、output は状態を変更しない。
+- checks の各評価器は Passed、Failed、Error の客観的実行結果だけを返す。PermissionDenied、Not Applicable、Blocked、required による表示、終了コードは engine が導出し、output は状態を変更しない。
 - EnvironmentReader のような小さな境界で必要な環境変数読込を差し替え可能にする。
+- Outcome、Reason、客観的実行結果とその不変条件は独立した結果モデルに置く。Runポリシーはengineに残す。
+- command moduleは、Run-scoped handlesとregistry、lifecycle、observation、containmentへ責務を分ける。spawn、wait、timeout、reason判定、cleanup判断はlifecycleに集約する。
+- containmentは単一commandのOS固有操作だけを担当する。UnixとWindowsの差はcommand module内部のstatic dispatchに限定し、公開traitや実行時切替は作らない。
+- command moduleの外側は、`CommandRunner::evaluate`、`CommandControl::begin_cleanup` / `force_terminate`、`CommandCleanup::wait`の4操作だけを使う。`CommandRunner`だけをClone + Send + Syncとし、`CommandControl`は単一所有にする。project rootはRun作成時に渡し、各評価は最小の検証済みcommand実行モデルだけを受け取る。
 
 通常依存は clap、serde、toml、serde_json、tokio、reqwest、sysinfo、thiserror、regex、console とする。reqwest は既定機能を切り、Rustls、WebPKI roots、gzip だけを有効にする。Unix の安全なプロセスグループ操作と Windows Job Object 用の依存は target-specific にする。開発依存は tempfile と assert_cmd。petgraph、predicates、futures-util、async-trait は使わない。
 
@@ -455,6 +488,9 @@ MVP はバイナリ専用 crate とし、autolib = false を設定する。公�
 - HTTP/TCP はテスト内ローカルサーバーだけを使い、外部サービスへ依存しない。
 - Active Check の許可行列、環境値非保持、gzip/identity、観測上限、timeout、中断、Broken Pipe を確認する。
 - command は stdin 閉鎖、環境継承、出力上限、timeout、通常の子孫プロセス終了を各 OS で確認する。
+- commandの主test seamは既存のCLI統合テストとする。実際のprepo processに対して、stdout/stderr、終了コード、JSON、signal中断、通常の子孫process終了を確認する。
+- command moduleの外側interfaceは実processで確認する。observationとlifecycleの純粋ロジックだけは内部単体テストとし、stream chunk境界、8 MiB上限、terminal reason優先規則を検証する。
+- containmentはOS別の実process試験で確認する。Windowsではsuspended生成からJob Object収容、resumeまでの順序とcleanupを検証する。
 - path はファイル、ディレクトリ、リンク、壊れたリンク、権限エラーを確認する。
 - Golden JSON/Markdown は duration を正規化し、順序、フィールド省略、エスケープを確認する。
 - CI は Ubuntu、macOS、Windows の各 OS で MSRV と最新 stable をテストし、stable Ubuntu では format と警告をエラー化した Clippy を実行する。

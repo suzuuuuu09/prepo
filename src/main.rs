@@ -7,6 +7,7 @@ mod checks;
 mod config;
 mod engine;
 mod output;
+mod result;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -171,6 +172,10 @@ fn check(
             eprintln!("error: group has no checks: {group}");
             return 4;
         }
+        Err(Err(Interrupted::Internal)) => {
+            eprintln!("error: prepo run failed");
+            return 3;
+        }
     };
     let output_format = match format {
         FormatArg::Human => output::Format::Human,
@@ -191,6 +196,7 @@ fn check(
 }
 
 enum Interrupted {
+    Internal,
     CtrlC {
         cleanup_failed: bool,
     },
@@ -207,50 +213,91 @@ async fn run_until_interrupted(
     permissions: engine::Permissions,
     sequential: bool,
 ) -> Result<engine::Run, Result<engine::SelectionError, Interrupted>> {
+    let project_root = config
+        .path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let (command_runner, command_control) = checks::command::for_run(project_root);
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).map_err(|_| {
-            Err(Interrupted::Sigterm {
-                cleanup_failed: true,
-            })
-        })?;
+        let mut sigterm =
+            signal(SignalKind::terminate()).map_err(|_| Err(Interrupted::Internal))?;
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        let engine = engine::run(&command_runner, config, ids, group, permissions, sequential);
+        tokio::pin!(engine);
         tokio::select! {
-            run = engine::run(config, ids, group, permissions, sequential) => run.map_err(Ok),
-            _ = tokio::signal::ctrl_c() => {
-                let cleanup_failed = wait_for_cleanup_or_second_signal(&mut sigterm).await;
+            biased;
+            _ = &mut ctrl_c => {
+                let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control, &mut sigterm).await;
                 Err(Err(Interrupted::CtrlC { cleanup_failed }))
             },
             _ = sigterm.recv() => {
-                let cleanup_failed = wait_for_cleanup_or_second_signal(&mut sigterm).await;
+                let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control, &mut sigterm).await;
                 Err(Err(Interrupted::Sigterm { cleanup_failed }))
             },
+            run = &mut engine => match run {
+                Ok(run) => Ok(run),
+                Err(engine::RunError::Selection(error)) => Err(Ok(error)),
+                Err(engine::RunError::CleaningUp | engine::RunError::Internal) => {
+                    Err(Err(Interrupted::Internal))
+                }
+            }
         }
     }
     #[cfg(not(unix))]
     {
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        let engine = engine::run(&command_runner, config, ids, group, permissions, sequential);
+        tokio::pin!(engine);
         tokio::select! {
-            run = engine::run(config, ids, group, permissions, sequential) => run.map_err(Ok),
-            _ = tokio::signal::ctrl_c() => {
-                let cleanup_failed = engine::terminate_active_commands().await.is_err();
+            biased;
+            _ = &mut ctrl_c => {
+                let cleanup_failed = wait_for_cleanup_or_second_signal(&command_control).await;
                 Err(Err(Interrupted::CtrlC { cleanup_failed }))
             },
+            run = &mut engine => match run {
+                Ok(run) => Ok(run),
+                Err(engine::RunError::Selection(error)) => Err(Ok(error)),
+                Err(engine::RunError::CleaningUp | engine::RunError::Internal) => {
+                    Err(Err(Interrupted::Internal))
+                }
+            }
         }
     }
 }
 
 #[cfg(unix)]
-async fn wait_for_cleanup_or_second_signal(sigterm: &mut tokio::signal::unix::Signal) -> bool {
-    let groups = match engine::begin_terminate_active_commands() {
-        Ok(groups) => groups,
-        Err(()) => return true,
-    };
-    let cleanup = engine::wait_for_active_commands(groups);
-    tokio::pin!(cleanup);
+async fn wait_for_cleanup_or_second_signal(
+    control: &checks::command::CommandControl,
+    sigterm: &mut tokio::signal::unix::Signal,
+) -> bool {
+    let cleanup = control.begin_cleanup();
+    let wait = cleanup.wait();
+    tokio::pin!(wait);
     tokio::select! {
-        result = &mut cleanup => result.is_err(),
-        _ = tokio::signal::ctrl_c() => engine::begin_terminate_active_commands().is_err(),
-        _ = sigterm.recv() => engine::begin_terminate_active_commands().is_err(),
+        biased;
+        result = &mut wait => result.is_err(),
+        _ = tokio::signal::ctrl_c() => control.force_terminate().is_err(),
+        _ = sigterm.recv() => control.force_terminate().is_err(),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_cleanup_or_second_signal(control: &checks::command::CommandControl) -> bool {
+    let cleanup = control.begin_cleanup();
+    let wait = cleanup.wait();
+    tokio::pin!(wait);
+    let second_signal = tokio::signal::ctrl_c();
+    tokio::pin!(second_signal);
+    tokio::select! {
+        biased;
+        result = &mut wait => result.is_err(),
+        _ = &mut second_signal => control.force_terminate().is_err(),
     }
 }
 

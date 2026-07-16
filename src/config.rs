@@ -160,15 +160,7 @@ pub enum CheckSpec {
         expected: PathExpected,
         kind: Option<PathKind>,
     },
-    Command {
-        command: Vec<String>,
-        expected_exit_code: i32,
-        stdout_contains: Option<Vec<u8>>,
-        stderr_not_contains: Option<Vec<u8>>,
-        working_directory: Option<String>,
-        env: BTreeMap<String, String>,
-        timeout_seconds: u64,
-    },
+    Command(CommandSpec),
     Process {
         process: String,
         expected: ProcessExpected,
@@ -187,6 +179,17 @@ pub enum CheckSpec {
         headers: BTreeMap<String, String>,
         timeout_seconds: u64,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct CommandSpec {
+    pub command: Vec<String>,
+    pub expected_exit_code: i32,
+    pub stdout_contains: Option<Vec<u8>>,
+    pub stderr_not_contains: Option<Vec<u8>>,
+    pub working_directory: Option<String>,
+    pub environment_overrides: BTreeMap<String, String>,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -921,15 +924,15 @@ fn validate_command(
     if !errors.is_empty() {
         return Err(errors);
     }
-    Ok(CheckSpec::Command {
+    Ok(CheckSpec::Command(CommandSpec {
         command: command.expect("command was validated"),
         expected_exit_code: check.expected_exit_code.unwrap_or(0),
         stdout_contains,
         stderr_not_contains,
         working_directory: check.working_directory.clone(),
-        env,
+        environment_overrides: env,
         timeout_seconds,
-    })
+    }))
 }
 
 fn command_timeout(value: Option<u64>, default_timeout_seconds: u64) -> Result<u64, String> {

@@ -1,5 +1,6 @@
 use crate::config::Platform;
-use crate::engine::{Outcome, Readiness, ResultRow, Run, Selection};
+use crate::engine::{Readiness, ResultRow, Run, Selection};
+use crate::result::Outcome;
 use serde::Serialize;
 use std::io::{self, Write};
 
