@@ -356,6 +356,7 @@ fn validate(raw: RawConfig, path: PathBuf) -> Result<ValidatedConfig, String> {
         }
     }
     for (index, check) in raw.checks.iter().enumerate() {
+        let errors = &mut check_errors[index];
         let mut dependencies = Vec::new();
         for dependency in &check.depends_on {
             match ids.get(dependency.as_str()) {

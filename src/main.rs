@@ -177,6 +177,13 @@ fn check(
             return 3;
         }
     };
+    if run
+        .results
+        .iter()
+        .any(|result| result.reason == Some(result::Reason::CommandCleanupFailed))
+    {
+        eprintln!("warning: command cleanup failed; command processes may remain");
+    }
     let output_format = match format {
         FormatArg::Human => output::Format::Human,
         FormatArg::Json => output::Format::Json,

@@ -372,7 +372,7 @@ name = "example"
 [[checks]]
 id = "first"
 type = "path"
-name = "First"
+name = ""
 path = "."
 expected = "exists"
 kind = "directory"
@@ -398,12 +398,13 @@ kind = "directory"
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let field = stderr.find("invalid checks.name").unwrap();
     let dependency = stderr
         .find("first depends on unknown check missing")
         .unwrap();
     let second = stderr.find("check second has invalid platforms").unwrap();
     assert!(
-        dependency < second,
+        field < dependency && dependency < second,
         "errors were reported out of order: {stderr}"
     );
 }
